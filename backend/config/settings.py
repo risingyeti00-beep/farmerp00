@@ -27,7 +27,7 @@ if not SECRET_KEY:
 DEBUG = env_bool("DEBUG", False)
 ALLOWED_HOSTS = env_list(
     "ALLOWED_HOSTS",
-    "localhost,127.0.0.1,.up.railway.app,.railway.app,.vercel.app,farmerp-frontend.vercel.app"
+    "localhost,127.0.0.1,.up.railway.app,.railway.app,.vercel.app,farmerp-frontend.vercel.app,farmerp.vercel.app"
 )
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
@@ -310,6 +310,7 @@ _CORS_DEFAULTS = [
     "http://localhost:3000",
     "https://farmerp1.vercel.app",
     "https://farmerp-frontend.vercel.app",
+    "https://farmerp.vercel.app",
 ]
 
 # Merge env var origins with defaults (no accidental overrides)
@@ -331,6 +332,7 @@ CORS_ALLOW_CREDENTIALS = True
 _CSRF_DEFAULTS = [
     "https://farmerp1.vercel.app",
     "https://farmerp-frontend.vercel.app",
+    "https://farmerp.vercel.app",
 ]
 _env_csrf = env_list("CSRF_TRUSTED_ORIGINS", "")
 CSRF_TRUSTED_ORIGINS = list(set(_CSRF_DEFAULTS + _env_csrf))
