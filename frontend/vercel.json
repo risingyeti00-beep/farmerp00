@@ -4,8 +4,6 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "rewrites": [
-    // 🚨 IMPORTANT: Railway deploy hone ke baad, neeche wali URL ko apne actual Railway URL se replace karein
-    // Jaise: https://farmerp-backend-production.up.railway.app → https://your-app-name.up.railway.app
     { "source": "/api/(.*)", "destination": "https://farmerp-backend-production.up.railway.app/api/$1" },
     { "source": "/media/(.*)", "destination": "https://farmerp-backend-production.up.railway.app/media/$1" },
     { "source": "/((?!assets/).*)", "destination": "/index.html" }
