@@ -4,8 +4,8 @@ FROM python:3.12-slim AS builder
 WORKDIR /app
 
 # Set environment variables
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 # System libs required by psycopg (libpq) and Pillow (jpeg/zlib)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -15,8 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
+# Pin pip and install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --upgrade pip --no-cache-dir && \
+    pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
@@ -25,8 +27,9 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # Set environment variables
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
 # Only runtime shared libraries needed (no build tools)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -46,7 +49,7 @@ COPY --chown=appuser:appuser . .
 
 # Collect static files at build time (WhiteNoise serves them at runtime).
 # A dummy SECRET_KEY is supplied only for this build step (settings.py requires
-# one to import); the real value is injected by Railway at runtime.
+# one to import); the real value is injected at runtime.
 RUN SECRET_KEY=build-time-only python manage.py collectstatic --noinput
 
 # NOTE: user-uploaded media goes to Supabase Storage, not local disk, so no
@@ -58,7 +61,12 @@ USER appuser
 
 EXPOSE 8000
 
+# ── Health check ─────────────────────────────────────────────────────────────
+# Use a socket check — guaranteed to work even without a /health/ endpoint.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+  CMD python -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('localhost', int('${PORT:-8000}'))); s.close()" || exit 1
+
 # ── Startup ────────────────────────────────────────────────────────────────
-# Run migrations + seed demo data, then start Daphne (HTTP + WebSocket).
+# Run migrations, then start Daphne (HTTP + WebSocket).
 # Railway sets $PORT automatically; fall back to 8000 for local Docker.
 CMD sh -c "python manage.py migrate --noinput && exec daphne -b 0.0.0.0 -p ${PORT:-8000} config.asgi:application"

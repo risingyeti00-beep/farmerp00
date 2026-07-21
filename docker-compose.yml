@@ -11,14 +11,21 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
+      timeout: 5s
       retries: 5
+      start_period: 10s
 
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: farmerp-backend:latest
     restart: unless-stopped
     env_file: ./backend/.env
     environment:
       DB_HOST: db
+      DB_PORT: 5432
+      DJANGO_SETTINGS_MODULE: config.settings
     depends_on:
       db:
         condition: service_healthy
@@ -27,16 +34,32 @@ services:
     ports:
       - "8000:8000"
     command: >
-      sh -c "python manage.py migrate &&
-             daphne -b 0.0.0.0 -p 8000 config.asgi:application"
+      sh -c "python manage.py migrate --noinput &&
+             exec daphne -b 0.0.0.0 -p 8000 config.asgi:application"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(5); s.connect(('localhost', 8000)); s.close()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: farmerp-frontend:latest
     restart: unless-stopped
     ports:
       - "80:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
 
 volumes:
   postgres_data:
