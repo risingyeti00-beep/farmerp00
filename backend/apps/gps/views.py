@@ -1,0 +1,419 @@
+from django.utils import timezone
+from drf_spectacular.utils import extend_schema
+from rest_framework import serializers, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from apps.accounts.models import Role
+from apps.core.mixins import BaseModelViewSet, EmployeeSelfScopedMixin
+from apps.core.permissions import RoleAllowed
+from apps.farms.views import FarmScopedQuerysetMixin
+
+from .models import ActivityPhoto, FieldActivity, Geofence, LocationPing
+from .serializers import (
+    ActivityPhotoSerializer,
+    FieldActivitySerializer,
+    GeofenceSerializer,
+    LocationPingSerializer,
+)
+from .utils import broadcast_ping, haversine_m
+
+
+class ClearAllPingsView(APIView):
+    """
+    Standalone endpoint to clear location pings for the caller's own farms.
+    Only SUPER_ADMIN and FARM_MANAGER roles may call this.
+    """
+    permission_classes = [RoleAllowed]
+    allowed_roles = [Role.FARM_MANAGER]
+    readonly_roles = []
+    serializer_class = serializers.Serializer
+
+    @extend_schema(responses={200: {"type": "object", "properties": {"detail": {"type": "string"}, "deleted": {"type": "integer"}}}})
+    def post(self, request):
+        # Farm-scoped for every caller, super admins included. This used to run
+        # LocationPing.objects.all().delete() for a SUPER_ADMIN, so one tenant's
+        # admin pressing "Clear All" destroyed every other tenant's GPS history
+        # — rows they cannot even see on the map. No role is in
+        # TENANT_GLOBAL_ROLES, so nobody gets the global delete.
+        #
+        # Pings with farm=NULL (the FK is nullable) are left alone: they are
+        # already invisible to the farm-scoped list, so "Clear All" clears
+        # exactly what the caller can see, and never someone else's history.
+        qs = LocationPing.objects.filter(farm__in=request.user.farms.all())
+        count, _ = qs.delete()
+        return Response(
+            {"detail": f"Deleted {count} location ping(s).", "deleted": count}
+        )
+
+
+class GeofenceViewSet(FarmScopedQuerysetMixin, BaseModelViewSet):
+    queryset = Geofence.objects.select_related("farm").all()
+    serializer_class = GeofenceSerializer
+    farm_lookup = "farm_id"
+    allowed_roles = [Role.FARM_MANAGER]
+    readonly_roles = [Role.EMPLOYEE]
+    filterset_fields = ["farm"]
+    search_fields = ["name"]
+
+    def perform_create(self, serializer):
+        farm = serializer.validated_data.get("farm")
+        center_lat = serializer.validated_data.get("center_lat") or (farm.latitude if farm else None)
+        center_lng = serializer.validated_data.get("center_lng") or (farm.longitude if farm else None)
+        name = serializer.validated_data.get("name") or (farm.name if farm else "Geofence")
+        serializer.save(
+            name=name,
+            center_lat=center_lat,
+            center_lng=center_lng,
+            radius_m=0,
+        )
+
+    def perform_update(self, serializer):
+        farm = serializer.validated_data.get("farm", serializer.instance.farm)
+        center_lat = serializer.validated_data.get("center_lat") or (farm.latitude if farm else None)
+        center_lng = serializer.validated_data.get("center_lng") or (farm.longitude if farm else None)
+        serializer.save(center_lat=center_lat, center_lng=center_lng)
+
+
+class LocationPingViewSet(EmployeeSelfScopedMixin, FarmScopedQuerysetMixin, BaseModelViewSet):
+    queryset = LocationPing.objects.select_related("user", "farm", "task").all()
+    serializer_class = LocationPingSerializer
+    farm_lookup = "farm_id"
+    employee_self_lookup = "user"  # pings link directly to the user
+    allowed_roles = [Role.FARM_MANAGER, Role.EMPLOYEE]
+    readonly_roles = []
+    filterset_fields = ["user", "farm", "activity", "task"]
+    search_fields = ["user__first_name", "user__last_name", "user__username"]
+    # This view filters date_from/date_to on recorded_at itself (below).
+    date_range_field = None
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        date_from = self.request.query_params.get("date_from")
+        date_to = self.request.query_params.get("date_to")
+        if date_from:
+            qs = qs.filter(recorded_at__gte=date_from)
+        if date_to:
+            # Include the full end day by adding a day
+            qs = qs.filter(recorded_at__date__lte=date_to)
+        return qs
+
+    def perform_create(self, serializer):
+        # Default the farm from the linked task so farm filters and the
+        # geofence check work without the client sending it explicitly.
+        task = serializer.validated_data.get("task")
+        activity = serializer.validated_data.get("activity")
+        if task:
+            existing = set(task.location_pings.values_list("activity", flat=True))
+            # Lock completed tasks
+            if LocationPing.Activity.CHECKOUT in existing:
+                raise serializers.ValidationError(
+                    {"detail": "This task is already completed and locked."}
+                )
+            # Workflow validations
+            if activity == LocationPing.Activity.CHECKIN:
+                if LocationPing.Activity.CHECKIN in existing:
+                    raise serializers.ValidationError(
+                        {"detail": "Before Work is already recorded for this task."}
+                    )
+            elif activity == LocationPing.Activity.DURING_WORK:
+                if LocationPing.Activity.CHECKIN not in existing:
+                    raise serializers.ValidationError(
+                        {"detail": "Record Before Work first."}
+                    )
+            elif activity == LocationPing.Activity.BREAK:
+                # BREAK is valid only if CHECKIN exists and not currently on break (no BREAK without RESUME)
+                if LocationPing.Activity.CHECKIN not in existing:
+                    raise serializers.ValidationError(
+                        {"detail": "Record Before Work first."}
+                    )
+                # If there's already an unresolved BREAK, reject
+                all_pings = list(task.location_pings.filter(
+                    activity__in=["BREAK", "RESUME"]
+                ).order_by("-recorded_at"))
+                if all_pings and all_pings[0].activity == "BREAK":
+                    raise serializers.ValidationError(
+                        {"detail": "Already on break. Resume work first."}
+                    )
+            elif activity == LocationPing.Activity.RESUME:
+                # RESUME is valid only if there's an unresolved BREAK
+                if LocationPing.Activity.BREAK not in existing:
+                    raise serializers.ValidationError(
+                        {"detail": "No active break to resume from."}
+                    )
+                # If RESUME already exists after the last BREAK, reject
+                # Check if the latest BREAK has a corresponding RESUME after it
+                all_pings = list(task.location_pings.filter(
+                    activity__in=["BREAK", "RESUME"]
+                ).order_by("-recorded_at"))
+                if all_pings and all_pings[0].activity == "RESUME":
+                    raise serializers.ValidationError(
+                        {"detail": "Already resumed from break. Take a break first."}
+                    )
+            elif activity == LocationPing.Activity.CHECKOUT:
+                if LocationPing.Activity.CHECKIN not in existing:
+                    raise serializers.ValidationError(
+                        {"detail": "Record Before Work first."}
+                    )
+                # DURING_WORK is optional — workers can complete without it.
+        extra = {}
+        if task and not serializer.validated_data.get("farm"):
+            extra["farm"] = task.farm
+        instance = serializer.save(
+            created_by=self.request.user,
+            user=self.request.user,
+            recorded_at=serializer.validated_data.get("recorded_at") or timezone.now(),
+            **extra,
+        )
+        self._advance_task_phase(instance)
+        broadcast_ping(instance, request=self.request)
+
+    @staticmethod
+    def _advance_task_phase(ping):
+        """Move the linked task through its work flow.
+
+        A Before-Work ping (CHECKIN) sets status to IN_PROGRESS and starts timer.
+        A During-Work ping (DURING_WORK) starts the work timer if needed.
+        A Break ping (BREAK) stops any active timer.
+        A Resume ping (RESUME) starts the timer again.
+        A Completed-Work ping (CHECKOUT) stops the timer and closes the task.
+        """
+        from apps.tasks.models import Task, TaskWorkSession
+
+        task = ping.task
+        if not task:
+            return
+        if ping.activity == LocationPing.Activity.CHECKIN:
+            # Before Work: set task status to IN_PROGRESS and start the timer
+            if task.status in (Task.Status.TODO, Task.Status.ASSIGNED, ""):
+                task.status = Task.Status.IN_PROGRESS
+                task.save(update_fields=["status", "updated_at"])
+            # Start the work timer if the worker doesn't have one running.
+            has_active = TaskWorkSession.objects.filter(
+                task=task, user=ping.user, end_time__isnull=True
+            ).exists()
+            if not has_active:
+                TaskWorkSession.objects.create(
+                    task=task,
+                    user=ping.user,
+                    created_by=ping.user,
+                    start_time=timezone.now(),
+                )
+        elif ping.activity == LocationPing.Activity.DURING_WORK:
+            # Start the work timer if the worker doesn't have one running.
+            has_active = TaskWorkSession.objects.filter(
+                task=task, user=ping.user, end_time__isnull=True
+            ).exists()
+            if not has_active:
+                TaskWorkSession.objects.create(
+                    task=task,
+                    user=ping.user,
+                    created_by=ping.user,
+                    start_time=timezone.now(),
+                )
+        elif ping.activity == LocationPing.Activity.BREAK:
+            # Stop any active work session when taking a break
+            TaskWorkSession.objects.filter(
+                task=task, user=ping.user, end_time__isnull=True
+            ).update(end_time=timezone.now())
+            # Set task status to ON_BREAK
+            if task.status != Task.Status.ON_BREAK:
+                task.status = Task.Status.ON_BREAK
+                task.save(update_fields=["status", "updated_at"])
+        elif ping.activity == LocationPing.Activity.RESUME:
+            # Start a new work session after break (timer continues from paused value)
+            has_active = TaskWorkSession.objects.filter(
+                task=task, user=ping.user, end_time__isnull=True
+            ).exists()
+            if not has_active:
+                TaskWorkSession.objects.create(
+                    task=task,
+                    user=ping.user,
+                    created_by=ping.user,
+                    start_time=timezone.now(),
+                )
+            # Ensure task status is back to IN_PROGRESS
+            if task.status == Task.Status.ON_BREAK:
+                task.status = Task.Status.IN_PROGRESS
+                task.save(update_fields=["status", "updated_at"])
+        elif ping.activity == LocationPing.Activity.CHECKOUT:
+            # Stop every running timer on the task, then close it.
+            TaskWorkSession.objects.filter(
+                task=task, end_time__isnull=True
+            ).update(end_time=timezone.now())
+            if task.status not in (
+                Task.Status.COMPLETED,
+                Task.Status.APPROVED,
+                Task.Status.CANCELLED,
+            ):
+                task.status = Task.Status.COMPLETED
+                task.progress = 100
+                task.save(update_fields=["status", "progress", "updated_at"])
+
+    @action(detail=False, methods=["get"])
+    def live(self, request):
+        qs = self.filter_queryset(self.get_queryset()).order_by(
+            "user_id", "-recorded_at"
+        )
+        latest = {}
+        for ping in qs:
+            if ping.user_id not in latest:
+                latest[ping.user_id] = ping
+        serializer = self.get_serializer(list(latest.values()), many=True, context={'request': request})
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"])
+    def route(self, request):
+        """Ordered route (path) of pings for a user, with total distance walked.
+
+        Query params: user (required for a single route), date (YYYY-MM-DD).
+        """
+        qs = self.filter_queryset(self.get_queryset())
+        user = request.query_params.get("user")
+        date_ = request.query_params.get("date")
+        if user:
+            qs = qs.filter(user_id=user)
+        if date_:
+            qs = qs.filter(recorded_at__date=date_)
+        qs = qs.order_by("recorded_at")
+
+        points, dist, prev = [], 0.0, None
+        for p in qs:
+            lat, lng = float(p.latitude), float(p.longitude)
+            if prev is not None:
+                dist += haversine_m(prev[0], prev[1], lat, lng)
+            prev = (lat, lng)
+            points.append(
+                {
+                    "lat": lat,
+                    "lng": lng,
+                    "recorded_at": p.recorded_at,
+                    "activity": p.activity,
+                    "user_name": p.user.get_full_name() or p.user.username if p.user else None,
+                }
+            )
+        return Response(
+            {"count": len(points), "total_distance_m": round(dist, 1), "points": points}
+        )
+
+
+class FieldActivityViewSet(EmployeeSelfScopedMixin, FarmScopedQuerysetMixin, BaseModelViewSet):
+    queryset = FieldActivity.objects.select_related(
+        "user", "farm", "task", "verified_by"
+    ).prefetch_related("photos").all()
+    serializer_class = FieldActivitySerializer
+    farm_lookup = "farm_id"
+    employee_self_lookup = "user"  # activities link directly to the user
+    allowed_roles = [Role.FARM_MANAGER, Role.EMPLOYEE]
+    readonly_roles = []
+    filterset_fields = ["user", "farm", "task", "status"]
+    search_fields = ["description", "user__first_name", "user__last_name"]
+
+    def get_queryset(self):
+        qs = FieldActivity.objects.select_related(
+            "user", "farm", "task", "verified_by"
+        ).prefetch_related("photos").all()
+        user = self.request.user
+        if user.role == Role.EMPLOYEE:
+            return qs.filter(user=user)
+        # Farm-scoped for every other role, super admins included: no role is in
+        # TENANT_GLOBAL_ROLES, and each super admin runs their own farm (see
+        # accounts.views.register_super_admin). This branch used to return the
+        # unfiltered queryset for SUPER_ADMIN, which showed every tenant's field
+        # activities here and — since `feed` and `field_progress` read the same
+        # queryset — on the Activity Monitor too.
+        #
+        # Managed farms stay in the union alongside assigned ones so a manager
+        # who owns a farm without being a member of it keeps seeing it; for a
+        # super admin the two sets are their own farm either way, because
+        # register_super_admin both adds the farm and makes them its manager.
+        from apps.farms.models import Farm
+        assigned_farm_ids = list(user.farms.values_list("id", flat=True))
+        managed_farm_ids = list(Farm.objects.filter(manager=user).values_list("id", flat=True))
+        farm_ids = list(set(assigned_farm_ids + managed_farm_ids))
+        return qs.filter(farm_id__in=farm_ids)
+
+    def perform_create(self, serializer):
+        serializer.save(
+            created_by=self.request.user,
+            user=self.request.user,
+            recorded_at=serializer.validated_data.get("recorded_at") or timezone.now(),
+        )
+
+    @action(detail=True, methods=["post"])
+    def verify(self, request, pk=None):
+        activity = self.get_object()
+        activity.status = FieldActivity.Status.VERIFIED
+        activity.verified_by = request.user
+        activity.verified_at = timezone.now()
+        activity.save(
+            update_fields=["status", "verified_by", "verified_at", "updated_at"]
+        )
+        return Response(self.get_serializer(activity, context={'request': request}).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        activity = self.get_object()
+        activity.status = FieldActivity.Status.REJECTED
+        activity.verified_by = request.user
+        activity.verified_at = timezone.now()
+        activity.save(
+            update_fields=["status", "verified_by", "verified_at", "updated_at"]
+        )
+        return Response(self.get_serializer(activity, context={'request': request}).data)
+
+    @action(detail=False, methods=["get"])
+    def feed(self, request):
+        """Live activity feed: the most recent field activities."""
+        qs = self.filter_queryset(self.get_queryset()).order_by("-created_at")[:50]
+        return Response(self.get_serializer(qs, many=True, context={'request': request}).data)
+
+    @action(detail=False, methods=["get"])
+    def field_progress(self, request):
+        """Field progress tracking: activity counts & verified-% per field/task."""
+        qs = self.filter_queryset(self.get_queryset())
+        farm = request.query_params.get("farm")
+        if farm:
+            qs = qs.filter(farm_id=farm)
+
+        groups = {}
+        for a in qs.select_related("field", "task"):
+            key = a.field_id or a.task_id or "unassigned"
+            label = (
+                a.field.name
+                if a.field_id
+                else (a.task.title if a.task_id else "Unassigned")
+            )
+            g = groups.setdefault(
+                key,
+                {"label": label, "total": 0, "verified": 0, "submitted": 0, "rejected": 0},
+            )
+            g["total"] += 1
+            if a.status == FieldActivity.Status.VERIFIED:
+                g["verified"] += 1
+            elif a.status == FieldActivity.Status.SUBMITTED:
+                g["submitted"] += 1
+            elif a.status == FieldActivity.Status.REJECTED:
+                g["rejected"] += 1
+
+        rows = []
+        for g in groups.values():
+            g["verified_pct"] = (
+                round(100 * g["verified"] / g["total"], 1) if g["total"] else 0
+            )
+            rows.append(g)
+        rows.sort(key=lambda r: r["label"])
+        return Response({"rows": rows})
+
+
+class ActivityPhotoViewSet(EmployeeSelfScopedMixin, FarmScopedQuerysetMixin, BaseModelViewSet):
+    queryset = ActivityPhoto.objects.select_related(
+        "activity", "activity__farm"
+    ).all()
+    serializer_class = ActivityPhotoSerializer
+    farm_lookup = "activity__farm_id"
+    employee_self_lookup = "activity__user"  # photos link via their activity
+    allowed_roles = [Role.FARM_MANAGER, Role.EMPLOYEE]
+    readonly_roles = []
+    filterset_fields = ["activity", "phase"]

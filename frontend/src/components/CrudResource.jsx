@@ -1,0 +1,978 @@
+import { useEffect, useState, useCallback, useRef } from "react";
+import { useTranslation } from "react-i18next";
+import {
+  Plus, Pencil, Trash2, Search, Download, Printer, ChevronLeft, ChevronRight, ChevronDown, Filter, Camera, X,
+} from "lucide-react";
+import LoadingSpinner from "./LoadingSpinner";
+import CameraCapture from "./CameraCapture";
+import { resource } from "../lib/api";
+import { compressImage } from "../lib/imageCompress";
+import { formatApiError } from "../lib/errors";
+import { exportExcel, printTable } from "../lib/export";
+import { useAuth } from "../context/AuthContext";
+import {
+  Button, Card, Input, Modal, MultiSelect, PageHeader, Select, Table, Textarea,
+} from "./ui";
+
+/**
+ * Config-driven CRUD page.
+ * props:
+ *  - title, subtitle
+ *  - path: DRF resource path (e.g. "farms")
+ *  - columns: [{key, header, render?}]
+ *  - fields: [{name, label, type?(text|number|date|select|textarea|datetime-local), options?, required?, readonly?, hideInTable?}]
+ *  - computedFields: [{ dependsOn: [fieldName], target: fieldName, compute: (form) => value }]
+ *  - canWrite: bool
+ *  - canEdit: bool
+ *  - rowActions: (row, reload) => ReactNode
+ *  - defaultValues: object
+ *  - searchable: bool
+ *  - showFarmFilter: bool — show farm dropdown filter
+ *  - showEmployeeFilter: bool — show employee dropdown filter
+ *  - showUserFilter: bool — show user dropdown filter
+ *  - showBuyerFilter: bool — show buyer text filter
+ */
+const EMPTY_PARAMS = {};
+
+export default function CrudResource({
+  title, subtitle, path, columns, fields = [], canWrite = true,
+  canEdit,
+  rowActions, defaultValues = {}, searchable = true, extraToolbar, listParams = EMPTY_PARAMS, onSaved,
+  refreshInterval, computedFields = [], rowClassName, sortRows, createOptions, footerColumns = [],
+  fieldDependencies = [], // [{ watch: "fieldName", target: "targetField", mapField: "sourceFieldInRecord" }]
+  renderFooter, // optional custom tfoot footer: (totals) => JSX
+  beforeSave, // optional payload transform before submit: (payload, mode) => payload
+  hideExport, // hide the default Excel/Print buttons
+  hideDateFilter, // hide the date-range filter
+  showFarmFilter, // show farm dropdown filter
+  showEmployeeFilter, // show employee dropdown filter
+  showUserFilter, // show user dropdown filter
+  showBuyerFilter, // show buyer text filter
+  selectable, // show per-row checkboxes + bulk delete (super admin only)
+  disablePagination, // fetch all matching rows on one page and hide the Prev/Next bar
+  defaultCurrentPeriod, // seed the month/year filter to the current real-time month
+}) {
+  const { t, i18n } = useTranslation();
+  const { hasRole, user } = useAuth();
+  const isEmployee = user?.role === "EMPLOYEE";
+  const canModify = canEdit !== undefined ? canEdit : canWrite;
+  // Only super admins may delete — managers can create/edit but never delete.
+  const canDelete = hasRole("SUPER_ADMIN");
+  const repo = resource(path);
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  // Multi-select (bulk delete) state — only used when `selectable` is set.
+  const showSelect = selectable && canDelete;
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [search, setSearch] = useState("");
+  // When defaultCurrentPeriod is set, seed the date filter to the current month
+  // so the page opens on this real-time month's data.
+  const _now = new Date();
+  const _p2 = (n) => String(n).padStart(2, "0");
+  const _monthFirst = `${_now.getFullYear()}-${_p2(_now.getMonth() + 1)}-01`;
+  const _monthLast = `${_now.getFullYear()}-${_p2(_now.getMonth() + 1)}-${_p2(new Date(_now.getFullYear(), _now.getMonth() + 1, 0).getDate())}`;
+  const [dateFrom, setDateFrom] = useState(defaultCurrentPeriod ? _monthFirst : "");
+  const [dateTo, setDateTo] = useState(defaultCurrentPeriod ? _monthLast : "");
+  const [selMonth, setSelMonth] = useState(defaultCurrentPeriod ? String(_now.getMonth() + 1) : "");
+  const [selYear, setSelYear] = useState(defaultCurrentPeriod ? String(_now.getFullYear()) : "");
+  const [page, setPage] = useState(1);
+  const [count, setCount] = useState(0);
+  const [hasNext, setHasNext] = useState(false);
+  const PAGE_SIZE = 25;
+  // Farm/Employee/User filter state
+  const [farmFilter, setFarmFilter] = useState("");
+  const [empFilter, setEmpFilter] = useState("");
+  const [userFilter, setUserFilter] = useState("");
+  const [buyerFilter, setBuyerFilter] = useState("");
+  const [appliedFarmFilter, setAppliedFarmFilter] = useState("");
+  const [appliedEmpFilter, setAppliedEmpFilter] = useState("");
+  const [appliedUserFilter, setAppliedUserFilter] = useState("");
+  const [appliedBuyerFilter, setAppliedBuyerFilter] = useState("");
+  const [farms, setFarms] = useState([]);
+  const [employees, setEmployees] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [modal, setModal] = useState(null);
+  const [form, setForm] = useState({});
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [fkOptions, setFkOptions] = useState({});
+  const [fkData, setFkData] = useState({}); // stores full records { fieldName: { id: record } }
+  const [currentRow, setCurrentRow] = useState(null);
+  const [showCreateDropdown, setShowCreateDropdown] = useState(false);
+  // Name of the file field whose "Take Photo" camera modal is open (or null).
+  const [cameraField, setCameraField] = useState(null);
+
+  // Immediately update a single row in local state (no API call)
+  const updateRow = useCallback((id, updates) => {
+    setRows(prev => prev.map(r => r.id === id ? { ...r, ...updates } : r));
+  }, []);
+
+  // Load options for FK select fields
+  useEffect(() => {
+    fields
+      .filter((f) => f.optionsFrom)
+      .forEach(async (f) => {
+        try {
+          const data = await resource(f.optionsFrom.path).list({ page_size: 200 });
+          const items = Array.isArray(data) ? data : data.results || [];
+          setFkOptions((prev) => ({
+            ...prev,
+            [f.name]: items.map((it) => ({
+              value: it.id,
+              label: f.optionsFrom.label(it),
+            })),
+          }));
+          setFkData((prev) => ({
+            ...prev,
+            [f.name]: Object.fromEntries(items.map((it) => [it.id, it])),
+          }));
+        } catch {
+          /* ignore */
+        }
+      });
+    // FK option lists only depend on the resource path; `fields` is an inline
+    // array literal that changes identity every render, so depending on it
+    // would refetch all option lists on every keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path]);
+
+  // Load farms/employees/users for filters
+  useEffect(() => {
+    if (showFarmFilter && !isEmployee) {
+      resource("farms").list({ page_size: 200 }).then((d) => setFarms(d.results || d)).catch(() => {});
+    }
+    if (showEmployeeFilter) {
+      resource("workforce/employees").list({ page_size: 200 }).then((d) => setEmployees(d.results || d)).catch(() => {});
+    }
+    if (showUserFilter && !isEmployee) {
+      resource("auth/users").list({ page_size: 200 }).then((d) => {
+        const all = Array.isArray(d) ? d : d.results || [];
+        setUsers(all);
+      }).catch(() => {});
+    }
+  }, [showFarmFilter, showEmployeeFilter, showUserFilter, isEmployee]);
+
+  const load = useCallback(async (options = {}) => {
+    setLoading(true);
+    try {
+      const params = { page, ...listParams };
+      // Show every matching row on one page (no Prev/Next) when requested.
+      // 1000 is the backend's max_page_size; a single month stays well under it.
+      if (disablePagination) params.page_size = 1000;
+      if (options.forceRefresh) params._t = Date.now();
+      if (search) params.search = search;
+      if (dateFrom) params.date_from = dateFrom;
+      if (dateTo) params.date_to = dateTo;
+      if (appliedFarmFilter) params.farm = appliedFarmFilter;
+      if (appliedEmpFilter) params.employee = appliedEmpFilter;
+      if (appliedUserFilter) params.user = appliedUserFilter;
+      if (appliedBuyerFilter) params.buyer = appliedBuyerFilter;
+      const data = await repo.list(params);
+      if (Array.isArray(data)) {
+        setRows(data);
+        setCount(data.length);
+        setHasNext(false);
+      } else {
+        setRows(data.results || []);
+        setCount(data.count ?? (data.results || []).length);
+        setHasNext(Boolean(data.next));
+      }
+    } catch (e) {
+      setError(e.response?.data?.detail || t("crud.loadFailed"));
+    } finally {
+      setLoading(false);
+    }
+  }, [path, search, page, dateFrom, dateTo, appliedFarmFilter, appliedEmpFilter, appliedUserFilter, appliedBuyerFilter, listParams, isEmployee, disablePagination, t]);
+
+  // Auto-refresh interval
+  const intervalRef = useRef(null);
+  const [live, setLive] = useState(false);
+
+  useEffect(() => {
+    load();
+    if (refreshInterval && refreshInterval > 0) {
+      setLive(true);
+      intervalRef.current = setInterval(() => {
+        load();
+        setLive(true);
+        setTimeout(() => setLive(false), 1000);
+      }, refreshInterval * 1000);
+    }
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, [load]);
+
+  // reset to page 1 when search or date filter changes
+  useEffect(() => {
+    setPage(1);
+  }, [search, dateFrom, dateTo]);
+
+  // Date range via selectable month / year dropdowns
+  const fmtDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const MONTHS = Array.from({ length: 12 }, (_, i) => ({
+    value: i + 1,
+    label: new Date(2000, i, 1).toLocaleString(i18n.language, { month: "short" }),
+  }));
+  const YEARS = Array.from({ length: 7 }, (_, i) => new Date().getFullYear() + 1 - i);
+
+  const applyPeriod = (month, year) => {
+    setSelMonth(month);
+    setSelYear(year);
+    if (year && month) {
+      const y = Number(year), m = Number(month);
+      setDateFrom(fmtDate(new Date(y, m - 1, 1)));
+      setDateTo(fmtDate(new Date(y, m, 0)));
+    } else if (year) {
+      setDateFrom(`${year}-01-01`);
+      setDateTo(`${year}-12-31`);
+    } else if (month) {
+      const y = new Date().getFullYear(), m = Number(month);
+      setDateFrom(fmtDate(new Date(y, m - 1, 1)));
+      setDateTo(fmtDate(new Date(y, m, 0)));
+    } else {
+      setDateFrom("");
+      setDateTo("");
+    }
+  };
+  const clearDates = () => { setDateFrom(""); setDateTo(""); setSelMonth(""); setSelYear(""); };
+
+  const openCreate = () => {
+    const initialForm = { ...defaultValues };
+    fields.forEach((fl) => {
+      if (fl.type === "multiselect" && !Array.isArray(initialForm[fl.name])) {
+        initialForm[fl.name] = [];
+      }
+      if (fl.type === "geopolygon" && !Array.isArray(initialForm[fl.name])) {
+        initialForm[fl.name] = [];
+      }
+    });
+    setForm(initialForm);
+    setError("");
+    setCurrentRow(null);
+    setModal({ mode: "create" });
+  };
+  // Arriving with ?new=1 (e.g. the dashboard "+ New" shortcut) opens the
+  // create modal immediately, then strips the flag so refresh/back don't
+  // reopen it.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("new") === "1" && canModify) {
+      openCreate();
+      params.delete("new");
+      const qs = params.toString();
+      window.history.replaceState({}, "", window.location.pathname + (qs ? `?${qs}` : ""));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const openEdit = (row) => {
+    const f = {};
+    fields.forEach((fl) => {
+      if (fl.type === "multiselect") {
+        f[fl.name] = row[fl.name]?.map((item) => (typeof item === 'object' && item?.id ? item.id : item)) ?? [];
+      } else if (fl.type === "geopolygon") {
+        f[fl.name] = Array.isArray(row[fl.name]) ? row[fl.name].map((p) => [p?.[0] ?? "", p?.[1] ?? ""]) : [];
+      } else if (fl.type === "coords") {
+        const lat = row[fl.targets?.[0]] ?? "";
+        const lng = row[fl.targets?.[1]] ?? "";
+        f[fl.name] = lat && lng ? `${lat}, ${lng}` : "";
+        if (fl.targets?.[0]) f[fl.targets[0]] = lat;
+        if (fl.targets?.[1]) f[fl.targets[1]] = lng;
+      } else {
+        f[fl.name] = row[fl.name] ?? "";
+      }
+    });
+    setForm(f);
+    setError("");
+    setCurrentRow(row);
+    setModal({ mode: "edit", id: row.id });
+  };
+
+  const hasFileField = fields.some((f) => f.type === "file");
+
+  const save = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    setError("");
+    try {
+      let payload = { ...form };
+      if (beforeSave) payload = beforeSave(payload, modal?.mode) || payload;
+      // Remove virtual coords field, keep the split targets
+      fields.forEach((fl) => {
+        if (fl.type === "coords") delete payload[fl.name];
+      });
+      // Geopolygon → clean array of [lat, lng] number pairs (drop empty corners)
+      let geoInvalid = false;
+      fields.forEach((fl) => {
+        if (fl.type === "geopolygon") {
+          const arr = Array.isArray(payload[fl.name]) ? payload[fl.name] : [];
+          const clean = arr
+            .filter((p) => p && p[0] !== "" && p[1] !== "" && p[0] != null && p[1] != null)
+            .map((p) => [Number(p[0]), Number(p[1])])
+            .filter((p) => !Number.isNaN(p[0]) && !Number.isNaN(p[1]));
+          if (fl.required && clean.length < (fl.corners || 3)) geoInvalid = true;
+          payload[fl.name] = clean;
+        }
+      });
+      if (geoInvalid) {
+        setError(t("crud.geopolygonRequired", "Enter every corner as: latitude, longitude"));
+        setSaving(false);
+        return;
+      }
+      fields.forEach((fl) => {
+        if (fl.type === "number" && payload[fl.name] !== "" && payload[fl.name] != null)
+          payload[fl.name] = Number(payload[fl.name]);
+        if (fl.type === "multiselect") {
+          if (!Array.isArray(payload[fl.name]))
+            payload[fl.name] = [];
+          // Keep original values as-is (supports both integer and UUID primary keys)
+        }
+      });
+
+      if (hasFileField) {
+        const fd = new FormData();
+        fields.forEach((fl) => {
+          const val = payload[fl.name];
+          if (val instanceof File) {
+            fd.append(fl.name, val, val.name);
+          } else if (fl.type !== "file" && val !== "" && val != null) {
+            if (fl.type === "multiselect" && Array.isArray(val)) {
+              val.forEach((v) => {
+                if (v) fd.append(fl.name, String(v));
+              });
+            } else {
+              fd.append(fl.name, String(val));
+            }
+          }
+        });
+        payload = fd;
+      } else {
+        fields.forEach((fl) => {
+          if (payload[fl.name] === "") payload[fl.name] = null;
+        });
+      }
+
+      let saved;
+      if (modal.mode === "create") {
+        saved = await repo.create(payload);
+      } else {
+        if (!hasFileField) {
+          Object.keys(payload).forEach((k) => {
+            if (payload[k] === null || payload[k] === "") delete payload[k];
+          });
+        }
+        saved = await repo.update(modal.id, payload);
+      }
+      setModal(null);
+      load();
+      if (onSaved) {
+        try { await onSaved(saved, modal.mode); } catch { /* side-effect only, non-fatal */ }
+      }
+    } catch (e) {
+      setError(formatApiError(e, t("crud.saveFailed")));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const del = async (row) => {
+    if (!confirm(t("crud.confirmDelete"))) return;
+    try {
+      await repo.remove(row.id);
+      load();
+    } catch (e) {
+      setError(formatApiError(e, t("crud.saveFailed")));
+    }
+  };
+
+  // Clear the selection whenever the visible rows change (new page / filter / reload)
+  useEffect(() => {
+    setSelectedIds(new Set());
+  }, [rows]);
+
+  const toggleRow = (id) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const allSelected = rows.length > 0 && rows.every((r) => selectedIds.has(r.id));
+
+  const toggleAll = () => {
+    setSelectedIds((prev) => {
+      if (rows.length > 0 && rows.every((r) => prev.has(r.id))) return new Set();
+      return new Set(rows.map((r) => r.id));
+    });
+  };
+
+  const bulkDelete = async () => {
+    if (selectedIds.size === 0) return;
+    if (!confirm(t("crud.confirmBulkDelete", { count: selectedIds.size }))) return;
+    setBulkDeleting(true);
+    setError("");
+    try {
+      for (const id of selectedIds) {
+        await repo.remove(id);
+      }
+      setSelectedIds(new Set());
+      load();
+    } catch (e) {
+      setError(formatApiError(e, t("crud.saveFailed")));
+    } finally {
+      setBulkDeleting(false);
+    }
+  };
+
+  // Build a total row object from footer column sums
+  const buildTotalRow = (dataRows, footerCols) => {
+    const totals = {};
+    footerCols.forEach((colKey) => {
+      totals[colKey] = dataRows.reduce((sum, row) => sum + (Number(row[colKey] || 0)), 0);
+    });
+    const row = { [columns[0]?.key]: t("common.total") };
+    columns.forEach((c) => {
+      if (c.key !== columns[0]?.key) row[c.key] = "";
+    });
+    return { ...row, ...totals };
+  };
+
+  // Fetch ALL rows for Excel export (respects all filters)
+  const exportAll = async () => {
+    let allRows = rows;
+    try {
+      const params = { page_size: 10000, ...listParams };
+      if (search) params.search = search;
+      if (dateFrom) params.date_from = dateFrom;
+      if (dateTo) params.date_to = dateTo;
+      if (appliedFarmFilter) params.farm = appliedFarmFilter;
+      if (appliedEmpFilter) params.employee = appliedEmpFilter;
+      if (appliedUserFilter) params.user = appliedUserFilter;
+      if (appliedBuyerFilter) params.buyer = appliedBuyerFilter;
+      const data = await repo.list(params);
+      allRows = Array.isArray(data) ? data : data.results || [];
+    } catch {
+      // fall back to current page rows
+    }
+    const exportRows = footerColumns.length > 0 && allRows.length > 0
+      ? [...allRows, buildTotalRow(allRows, footerColumns)]
+      : allRows;
+    exportExcel(exportRows, columns, `${path.replace(/\//g, "-")}.xlsx`, title);
+  };
+
+  const allColumns = [
+    ...columns,
+    ...(canWrite || rowActions
+      ? [
+          {
+            key: "_actions",
+            header: t("common.actions"),
+            render: (row) => (
+              <div className="flex items-center gap-1">
+                {rowActions && rowActions(row, load, updateRow)}
+                {canModify && (
+                  <button onClick={() => openEdit(row)} className="rounded p-1.5 text-gray-500 hover:bg-gray-100" title={t("common.edit")}>
+                    <Pencil size={15} />
+                  </button>
+                )}
+                {canDelete && (
+                  <button onClick={() => del(row)} className="rounded p-1.5 text-red-500 hover:bg-red-50" title={t("common.delete")}>
+                    <Trash2 size={15} />
+                  </button>
+                )}
+              </div>
+            ),
+          },
+        ]
+      : []),
+  ];
+
+  return (
+    <div>
+      <PageHeader
+        title={title}
+        subtitle={subtitle}
+        action={
+          canWrite && (
+            createOptions ? (
+              <div className="relative">
+                <Button onClick={() => setShowCreateDropdown(!showCreateDropdown)}>
+                  <Plus size={16} /> {t("crud.new")} <ChevronDown size={14} />
+                </Button>
+                {showCreateDropdown && (
+                  <>
+                    <div className="fixed inset-0 z-10" onClick={() => setShowCreateDropdown(false)} />
+                    <div className="absolute right-0 top-full z-20 mt-1 w-44 rounded-xl border border-gray-200 bg-white py-1 shadow-lift">
+                      {createOptions.map((opt) => (
+                        <button
+                          key={opt.label}
+                          onClick={() => {
+                            const initialForm = { ...defaultValues, ...(opt.values || {}) };
+                            fields.forEach((fl) => {
+                              if (fl.type === "multiselect" && !Array.isArray(initialForm[fl.name])) {
+                                initialForm[fl.name] = [];
+                              }
+                            });
+                            setForm(initialForm);
+                            setError("");
+                            setCurrentRow(null);
+                            setModal({ mode: "create" });
+                            setShowCreateDropdown(false);
+                          }}
+                          className="flex w-full items-center gap-2 px-4 py-2.5 text-sm text-gray-700 hover:bg-brand-50 hover:text-brand-700"
+                        >
+                          <Plus size={15} className="text-gray-400" />
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+            ) : (
+              <Button onClick={openCreate}>
+                <Plus size={16} /> {t("crud.new")}
+              </Button>
+            )
+          )
+        }
+      />
+
+      <Card>
+        <div className="mb-4 flex flex-wrap items-center gap-3">
+          {searchable && (
+            <div className="relative flex-1 min-w-[200px]">
+              <Search size={16} className="absolute left-3 top-2.5 text-gray-400" />
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder={t("crud.search")}
+                className="w-full rounded-lg border border-gray-300 py-2 pl-9 pr-3 text-sm outline-none focus:border-brand-500"
+              />
+            </div>
+          )}
+          {!hideDateFilter && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <input
+                type="date"
+                value={dateFrom}
+                onChange={(e) => setDateFrom(e.target.value)}
+                title={t("crud.fromDate")}
+                className="rounded-lg border border-gray-300 px-2.5 py-1.5 text-xs outline-none focus:border-brand-500"
+              />
+              <span className="text-xs text-gray-400">→</span>
+              <input
+                type="date"
+                value={dateTo}
+                onChange={(e) => setDateTo(e.target.value)}
+                title={t("crud.toDate")}
+                className="rounded-lg border border-gray-300 px-2.5 py-1.5 text-xs outline-none focus:border-brand-500"
+              />
+              <select
+                value={selMonth}
+                onChange={(e) => applyPeriod(e.target.value, selYear)}
+                title={t("header.month")}
+                className="rounded-lg border border-gray-300 px-2 py-1.5 text-xs text-gray-600 outline-none focus:border-brand-500"
+              >
+                <option value="">{t("header.month")}</option>
+                {MONTHS.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
+              </select>
+              <select
+                value={selYear}
+                onChange={(e) => applyPeriod(selMonth, e.target.value)}
+                title={t("header.year")}
+                className="rounded-lg border border-gray-300 px-2 py-1.5 text-xs text-gray-600 outline-none focus:border-brand-500"
+              >
+                <option value="">{t("header.year")}</option>
+                {YEARS.map((y) => <option key={y} value={y}>{y}</option>)}
+              </select>
+              {(dateFrom || dateTo) && (
+                <button onClick={clearDates} className="rounded-lg px-2 py-1.5 text-xs font-medium text-red-500 hover:bg-red-50">
+                  {t("crud.clearDates")}
+                </button>
+              )}
+            </div>
+          )}
+          {/* Farm, Employee, User & Buyer Filters with Apply button */}
+          {(showFarmFilter || showEmployeeFilter || showUserFilter || showBuyerFilter) && (          <div className="flex flex-wrap items-end gap-2 rounded-lg bg-gray-50 p-2 border border-gray-200">
+              {showFarmFilter && (
+                <div className="w-full sm:w-auto sm:min-w-[150px]">
+                  <select
+                    value={farmFilter}
+                    onChange={(e) => setFarmFilter(e.target.value)}
+                    className="w-full rounded-lg border border-gray-300 px-2.5 py-1.5 text-xs outline-none focus:border-brand-500"
+                  >
+                    <option value="">{t("workforce.allFarms")}</option>
+                    {farms.map((f) => (
+                      <option key={f.id} value={f.id}>{f.name}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {showEmployeeFilter && (
+                <div className="w-full sm:w-auto sm:min-w-[150px]">
+                  <select
+                    value={empFilter}
+                    onChange={(e) => setEmpFilter(e.target.value)}
+                    className="w-full rounded-lg border border-gray-300 px-2.5 py-1.5 text-xs outline-none focus:border-brand-500"
+                  >
+                    <option value="">{t("common.allEmployees")}</option>
+                    {employees.map((e) => (
+                      <option key={e.id} value={e.id}>{e.name}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {showUserFilter && (
+                <div className="w-full sm:w-auto sm:min-w-[150px]">
+                  <select
+                    value={userFilter}
+                    onChange={(e) => setUserFilter(e.target.value)}
+                    className="w-full rounded-lg border border-gray-300 px-2.5 py-1.5 text-xs outline-none focus:border-brand-500"
+                  >
+                    <option value="">{t("common.allUsers")}</option>
+                    {users.map((u) => (
+                      <option key={u.id} value={u.id}>{u.full_name || u.username}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {showBuyerFilter && (
+                <div className="w-full sm:w-auto sm:min-w-[150px]">
+                  <input
+                    value={buyerFilter}
+                    onChange={(e) => setBuyerFilter(e.target.value)}
+                    placeholder={t("header.buyer")}
+                    className="w-full rounded-lg border border-gray-300 px-2.5 py-1.5 text-xs outline-none focus:border-brand-500"
+                  />
+                </div>
+              )}
+              <button
+                onClick={() => { setAppliedFarmFilter(farmFilter); setAppliedEmpFilter(empFilter); setAppliedUserFilter(userFilter); setAppliedBuyerFilter(buyerFilter); setPage(1); }}
+                className="inline-flex items-center gap-1 rounded-lg bg-brand-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-700"
+              >
+                <Filter size={13} /> {t("common.applyFilters")}
+              </button>
+              {(appliedFarmFilter || appliedEmpFilter || appliedUserFilter || appliedBuyerFilter) && (
+                <button
+                  onClick={() => { setFarmFilter(""); setEmpFilter(""); setUserFilter(""); setBuyerFilter(""); setAppliedFarmFilter(""); setAppliedEmpFilter(""); setAppliedUserFilter(""); setAppliedBuyerFilter(""); setPage(1); }}
+                  className="rounded-lg px-2 py-1.5 text-xs font-medium text-red-500 hover:bg-red-50"
+                >
+                  {t("common.reset")}
+                </button>
+              )}
+            </div>
+          )}
+          {extraToolbar}
+          {showSelect && selectedIds.size > 0 && (
+            <Button variant="danger" disabled={bulkDeleting} onClick={bulkDelete}>
+              <Trash2 size={15} />
+              {bulkDeleting
+                ? t("crud.deleting", "Removing…")
+                : t("crud.removeSelected", { count: selectedIds.size })}
+            </Button>
+          )}
+          <div className="flex items-center gap-3 ml-auto">
+            {refreshInterval && (
+              <span className="hidden sm:inline-flex items-center gap-1.5 text-xs text-gray-500">
+                <span className="relative flex h-2 w-2">
+                  <span
+                    className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-75 ${
+                      live ? "bg-green-400" : "bg-gray-300"
+                    }`}
+                  />
+                  <span
+                    className={`relative inline-flex h-2 w-2 rounded-full ${
+                      live ? "bg-green-500" : "bg-gray-400"
+                    }`}
+                  />
+                </span>
+                {live ? t("common.live") : `${refreshInterval}s`}
+              </span>
+            )}
+            {!hideExport && (
+              <div className="flex gap-2">
+                <Button variant="secondary" disabled={loading} onClick={exportAll}>
+                  <Download size={15} /> {t("crud.excel")}
+                </Button>
+                <Button variant="secondary" disabled={loading} onClick={() => printTable(title, rows, columns)}>
+                  <Printer size={15} /> {t("crud.print")}
+                </Button>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {error && <p className="mb-3 rounded bg-red-50 p-2 text-sm text-red-600">{error}</p>}
+        {loading ? (
+          <div className="py-4">
+            <LoadingSpinner fullScreen={false} size="md" message={t("crud.loading")} />
+          </div>
+        ) : (
+          <Table
+            columns={allColumns}
+            rows={sortRows ? [...rows].sort(sortRows) : rows}
+            rowClassName={rowClassName}
+            footerColumns={footerColumns}
+            totalLabel={t("common.total")}
+            renderFooter={renderFooter}
+            selectable={showSelect}
+            selectedIds={selectedIds}
+            onToggleRow={toggleRow}
+            onToggleAll={toggleAll}
+            allSelected={allSelected}
+          />
+        )}
+
+        {!disablePagination && (count > PAGE_SIZE || page > 1) && (
+          <div className="mt-4 flex items-center justify-between text-sm text-gray-500">
+            <span>
+              {count} {count === 1 ? t("crud.record") : t("crud.records")} · {t("crud.page")} {page}
+              {count > 0 ? ` ${t("crud.of")} ${Math.max(1, Math.ceil(count / PAGE_SIZE))}` : ""}
+            </span>
+            <div className="flex gap-1">
+              <button
+                disabled={page <= 1}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                className="inline-flex items-center rounded-lg border border-gray-300 px-2 py-1 disabled:opacity-40 hover:bg-gray-50"
+              >
+                <ChevronLeft size={16} /> {t("crud.prev")}
+              </button>
+              <button
+                disabled={!hasNext}
+                onClick={() => setPage((p) => p + 1)}
+                className="inline-flex items-center rounded-lg border border-gray-300 px-2 py-1 disabled:opacity-40 hover:bg-gray-50"
+              >
+                {t("crud.next")} <ChevronRight size={16} />
+              </button>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <Modal
+        open={!!modal}
+        onClose={() => setModal(null)}
+        title={modal?.mode === "create" ? t("crud.newTitle", { title }) : t("crud.editTitle", { title })}
+      >
+        <form onSubmit={save} className="space-y-3">
+          {error && <p className="rounded bg-red-50 p-2 text-sm text-red-600">{error}</p>}
+          {fields.map((fl) => {
+            // Conditionally hide a field based on the current form state
+            // (e.g. show Monthly Salary only when wage type is Monthly).
+            const isHidden = typeof fl.hidden === "function" ? fl.hidden(form, modal?.mode) : fl.hidden;
+            if (isHidden) return null;
+            const isReadonly = typeof fl.readonly === "function" ? fl.readonly(currentRow, modal?.mode) : fl.readonly;
+            const handleChange = (e) => {
+              const newValue = e.target.value;
+              let updates = { ...form, [fl.name]: newValue };
+              // Auto-fill dependent fields from FK record data
+              fieldDependencies.forEach((dep) => {
+                if (dep.watch === fl.name && newValue) {
+                  const record = fkData[dep.watch]?.[newValue];
+                  if (record && dep.mapField) {
+                    updates[dep.target] = record[dep.mapField];
+                  }
+                }
+              });
+              computedFields.forEach((cf) => {
+                if (cf.dependsOn.includes(fl.name)) {
+                  updates[cf.target] = cf.compute(updates);
+                }
+              });
+              setForm(updates);
+            };
+            const common = {
+              value: form[fl.name] != null ? String(form[fl.name]) : "",
+              onChange: handleChange,
+              required: fl.required,
+              disabled: isReadonly,
+              placeholder: fl.placeholder,
+            };
+            if (isReadonly) {
+              return (
+                <div key={fl.name}>
+                  <label className="mb-1 block text-sm font-medium text-gray-700">{fl.label}</label>
+                  <div className="flex h-10 items-center rounded-xl border border-gray-200 bg-gray-50 px-3.5 text-sm font-semibold text-gray-900">
+                    {fl.type === "number"
+                      ? `₹${Number(form[fl.name] || 0).toLocaleString("en-IN")}`
+                      : form[fl.name] || t("crud.readonlyDisplay")}
+                  </div>
+                </div>
+              );
+            }
+            if (fl.type !== "multiselect" && (fl.type === "select" || fl.optionsFrom)) {
+              const opts = fl.optionsFrom ? fkOptions[fl.name] || [] : fl.options;
+              return (
+                <Select key={fl.name} label={fl.label} {...common}>
+                  <option value="">{t("crud.noOptions")}</option>
+                  {opts.map((o) => (
+                    <option key={o.value ?? o} value={o.value ?? o}>
+                      {o.label ?? o}
+                    </option>
+                  ))}
+                </Select>
+              );
+            }
+            if (fl.type === "multiselect") {
+              const opts = fl.optionsFrom ? fkOptions[fl.name] || [] : fl.options || [];
+              const selected = Array.isArray(form[fl.name]) ? form[fl.name] : [];
+              return (
+                <MultiSelect
+                  key={fl.name}
+                  label={fl.label}
+                  options={opts}
+                  value={selected}
+                  disabled={isReadonly}
+                  placeholder={t("crud.noOptions")}
+                  onChange={(next) => setForm({ ...form, [fl.name]: next })}
+                />
+              );
+            }
+            if (fl.type === "file")
+              return (
+                <div key={fl.name}>
+                  <label className="mb-1 block text-sm font-medium text-gray-700">{fl.label}</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="file"
+                      accept={t("crud.fileAccept")}
+                      capture="environment"
+                      onChange={async (e) => {
+                        const f = e.target.files[0];
+                        const small = f ? await compressImage(f) : "";
+                        setForm((prev) => ({ ...prev, [fl.name]: small }));
+                      }}
+                      className="w-full rounded-lg border border-gray-300 text-sm file:mr-3 file:rounded-l-lg file:border-0 file:bg-brand-50 file:px-3 file:py-2 file:text-sm file:font-medium file:text-brand-700 hover:file:bg-brand-100"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setCameraField(fl.name)}
+                      title={t("common.takePhoto")}
+                      className="flex shrink-0 items-center gap-1.5 rounded-lg border border-brand-200 bg-brand-50 px-3 py-2 text-sm font-medium text-brand-700 hover:bg-brand-100"
+                    >
+                      <Camera size={16} /> {t("common.takePhoto")}
+                    </button>
+                  </div>
+                  {form[fl.name] && form[fl.name] instanceof File && (
+                    <p className="mt-1 text-xs text-gray-500">{t("crud.fileHint", { name: form[fl.name].name })}</p>
+                  )}
+                </div>
+              );
+            if (fl.type === "coords") {
+              const coordVal = form[fl.name] ||
+                (form[fl.targets?.[0]] && form[fl.targets?.[1]]
+                  ? `${form[fl.targets[0]]}, ${form[fl.targets[1]]}`
+                  : "");
+              return (
+                <div key={fl.name}>
+                  <label className="mb-1 block text-sm font-medium text-gray-700">{fl.label}</label>
+                  <input
+                    type="text"
+                    placeholder={fl.placeholder || "lat, lng"}
+                    value={coordVal}
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      const parts = raw.split(",").map((p) => p.trim());
+                      const updates = { ...form, [fl.name]: raw };
+                      if (fl.targets?.[0]) updates[fl.targets[0]] = parts[0] || "";
+                      if (fl.targets?.[1]) updates[fl.targets[1]] = parts[1] || "";
+                      setForm(updates);
+                    }}
+                    className="w-full rounded-xl border border-gray-300 px-3.5 py-2.5 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+                  />
+                  <p className="mt-1 text-xs text-gray-400">Enter as: latitude, longitude (e.g. 28.6139, 77.2090)</p>
+                </div>
+              );
+            }
+            if (fl.type === "geopolygon") {
+              // `corners` is the MINIMUM number of corner rows to show (default
+              // 4). Users can add as many more as their farm shape needs via the
+              // "+ Corner" button; extra corners flow through to the polygon and
+              // the geofence check-in unchanged.
+              const minCorners = fl.corners || 4;
+              const val = Array.isArray(form[fl.name]) ? form[fl.name] : [];
+              const count = Math.max(minCorners, val.length);
+              const rows = Array.from({ length: count }, (_, k) => val[k] || ["", ""]);
+              const commit = (next) => setForm({ ...form, [fl.name]: next });
+              const setCorner = (i, raw) => {
+                const parts = raw.split(",").map((p) => p.trim());
+                commit(rows.map((p, k) => (k === i ? [parts[0] ?? "", parts[1] ?? ""] : p)));
+              };
+              const addCorner = () => commit([...rows, ["", ""]]);
+              const removeCorner = (i) => commit(rows.filter((_, k) => k !== i));
+              const cornerWord = fl.cornerLabel || "Corner";
+              return (
+                <div key={fl.name}>
+                  <label className="mb-1 block text-sm font-medium text-gray-700">{fl.label}</label>
+                  <div className="space-y-2">
+                    {rows.map((pair, i) => {
+                      const str = pair[0] !== "" && pair[1] !== "" && pair[0] != null && pair[1] != null ? `${pair[0]}, ${pair[1]}` : "";
+                      return (
+                        <div key={i} className="flex items-center gap-2">
+                          <span className="w-14 shrink-0 text-xs font-semibold text-gray-500">{cornerWord} {i + 1}</span>
+                          <input
+                            type="text"
+                            placeholder="latitude, longitude"
+                            value={str}
+                            onChange={(e) => setCorner(i, e.target.value)}
+                            className="w-full rounded-xl border border-gray-300 px-3.5 py-2.5 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+                          />
+                          {count > minCorners && (
+                            <button
+                              type="button"
+                              onClick={() => removeCorner(i)}
+                              title={t("crud.removeCorner", "Remove corner")}
+                              className="shrink-0 rounded-lg p-2 text-red-500 hover:bg-red-50"
+                            >
+                              <X size={15} />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={addCorner}
+                    className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-brand-200 bg-brand-50 px-3 py-2 text-sm font-medium text-brand-700 hover:bg-brand-100"
+                  >
+                    <Plus size={15} /> {t("crud.addCorner", "Corner Lat/Lng")}
+                  </button>
+                  <p className="mt-1 text-xs text-gray-400">{fl.hint || "Enter each corner as: latitude, longitude"}</p>
+                </div>
+              );
+            }
+            if (fl.type === "textarea")
+              return <Textarea key={fl.name} label={fl.label} rows={3} {...common} />;
+            return (
+              <Input key={fl.name} label={fl.label} type={fl.type || "text"} {...common} />
+            );
+          })}
+          <div className="flex justify-end gap-2 pt-2">
+            <Button type="button" variant="secondary" onClick={() => setModal(null)}>
+              {t("crud.cancel")}
+            </Button>
+            <Button type="submit" disabled={saving}>
+              {saving ? t("crud.saving") : t("crud.save")}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      <CameraCapture
+        open={!!cameraField}
+        title={t("common.takePhoto")}
+        onClose={() => setCameraField(null)}
+        onCapture={(file) => {
+          if (cameraField) setForm((prev) => ({ ...prev, [cameraField]: file }));
+          setCameraField(null);
+        }}
+      />
+    </div>
+  );
+}
