@@ -8,8 +8,8 @@ from apps.accounts.models import User, Role
 
 def recreate_super_admin():
     """Create or reactivate the main super admin account."""
-    username = "jayvati"
-    email = "jayvati@example.com"
+    username = "jayvadi"
+    email = "jayvadi@example.com"
     default_password = "Admin@123"
 
     if User.objects.filter(username=username).exists():

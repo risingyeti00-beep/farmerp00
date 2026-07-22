@@ -15,8 +15,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--username",
             type=str,
-            default="jayvati",
-            help="Username of the super admin (default: jayvati)",
+            default="jayvadi",
+            help="Username of the super admin (default: jayvadi)",
         )
 
     def handle(self, *args, **options):
@@ -26,7 +26,7 @@ class Command(BaseCommand):
         user, created = User.objects.update_or_create(
             username=username,
             defaults={
-                "email": "jayvati@example.com",
+                "email": "jayvadi@example.com",
                 "phone": "",
                 "role": "SUPER_ADMIN",
                 "is_staff": True,

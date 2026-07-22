@@ -2,10 +2,10 @@
 Make a specific user the sole main super admin (is_superuser=True).
 
 Usage:
-    python manage.py set_primary_admin --username=jayvati
+    python manage.py set_primary_admin --username=jayvadi
 
 What it does:
-    1. Finds the user with the given username (default: jayvati)
+    1. Finds the user with the given username (default: jayvadi)
     2. Sets that user as the primary admin (is_superuser=True, is_staff=True, role=SUPER_ADMIN, is_active=True)
     3. Sets ALL other users' is_superuser=False so only the specified user has Django superuser status
 
@@ -25,8 +25,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--username",
             type=str,
-            default="jayvati",
-            help="Username to promote to main super admin (default: jayvati)",
+            default="jayvadi",
+            help="Username to promote to main super admin (default: jayvadi)",
         )
 
     def handle(self, *args, **options):
@@ -88,6 +88,6 @@ class Command(BaseCommand):
                 self.style.WARNING(
                     "\n⚠️  Previous main admin 'risingyeti' has been demoted.\n"
                     "   Update the reset_super_admin endpoint and update_super_admin command\n"
-                    "   to use 'jayvati' instead of 'risingyeti' so emergency resets work."
+                    "   to use 'jayvadi' instead of 'risingyeti' so emergency resets work."
                 )
             )

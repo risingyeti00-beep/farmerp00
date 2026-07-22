@@ -18,8 +18,10 @@ from apps.sheets_sync.registry import _flatten, _file_url, _image_preview
 logger = logging.getLogger(__name__)
 
 SUPER_ADMINS = "super_admins"
+ALL_USERS     = "all_users"
 
 SUPER_ADMINS_TITLE = "Super Admins"
+ALL_USERS_TITLE    = "Users"
 
 SUPER_ADMINS_HEADERS = [
     "id",
@@ -84,13 +86,70 @@ def build_super_admins():
     return SUPER_ADMINS_TITLE, SUPER_ADMINS_HEADERS, rows
 
 
+ALL_USERS_HEADERS = [
+    "id",
+    "username",
+    "full_name",
+    "email",
+    "phone",
+    "role",
+    "is_active",
+    "farms",
+    "date_joined",
+    "last_login",
+    "preferred_language",
+    "aadhaar_number",
+    "aadhaar_photo",
+    "aadhaar_photo_preview",
+    "avatar",
+    "avatar_preview",
+]
+
+
+def build_all_users():
+    """(title, headers, rows) — every non-deleted user across all roles."""
+    from apps.accounts.models import User
+
+    users = (
+        User.objects.filter(deleted_at__isnull=True)
+        .prefetch_related("farms")
+        .order_by("role", "username")
+    )
+
+    rows = []
+    for u in users:
+        avatar_url  = _file_url(u.avatar)
+        aadhaar_url = _file_url(u.aadhaar_photo)
+        rows.append([
+            _flatten(u.id),
+            _flatten(u.username),
+            _flatten(u.get_full_name() or u.username),
+            _flatten(u.email),
+            _flatten(u.phone),
+            _flatten(u.role),
+            _flatten(u.is_active),
+            _flatten(", ".join(sorted(f.name for f in u.farms.all()))),
+            _flatten(u.date_joined),
+            _flatten(u.last_login),
+            _flatten(u.preferred_language),
+            _flatten(u.aadhaar_number),
+            aadhaar_url,
+            _image_preview(aadhaar_url),
+            avatar_url,
+            _image_preview(avatar_url),
+        ])
+    return ALL_USERS_TITLE, ALL_USERS_HEADERS, rows
+
+
 # name -> builder
 BUILDERS = {
     SUPER_ADMINS: build_super_admins,
+    ALL_USERS:    build_all_users,
 }
 
 TITLES = {
     SUPER_ADMINS: SUPER_ADMINS_TITLE,
+    ALL_USERS:    ALL_USERS_TITLE,
 }
 
 

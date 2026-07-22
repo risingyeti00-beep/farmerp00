@@ -74,30 +74,36 @@ def _user_pre_save(sender, instance, raw=False, **kwargs):
 def _user_post_save(sender, instance, raw=False, **kwargs):
     if raw:
         return
-    from apps.accounts.models import Role
-
-    prev = getattr(instance, _PREV_ROLE, None)
-    if instance.role != Role.SUPER_ADMIN and prev != Role.SUPER_ADMIN:
-        return  # nothing about the super-admin roster changed
+    # Rebuild both Users sheet and Super Admins sheet on any user save
     transaction.on_commit(
-        lambda: worker.enqueue_custom(custom_sheets.SUPER_ADMINS)
+        lambda: worker.enqueue_custom(custom_sheets.ALL_USERS)
     )
+    from apps.accounts.models import Role
+    prev = getattr(instance, _PREV_ROLE, None)
+    if instance.role == Role.SUPER_ADMIN or prev == Role.SUPER_ADMIN:
+        transaction.on_commit(
+            lambda: worker.enqueue_custom(custom_sheets.SUPER_ADMINS)
+        )
 
 
 def _user_post_delete(sender, instance, **kwargs):
-    from apps.accounts.models import Role
-
-    if instance.role != Role.SUPER_ADMIN:
-        return
     transaction.on_commit(
-        lambda: worker.enqueue_custom(custom_sheets.SUPER_ADMINS)
+        lambda: worker.enqueue_custom(custom_sheets.ALL_USERS)
     )
+    from apps.accounts.models import Role
+    if instance.role == Role.SUPER_ADMIN:
+        transaction.on_commit(
+            lambda: worker.enqueue_custom(custom_sheets.SUPER_ADMINS)
+        )
 
 
 def _user_farms_changed(sender, action, **kwargs):
-    """The sheet shows each admin's farms, so m2m edits must rebuild it."""
+    """Farms changed — rebuild both Users and Super Admins sheets."""
     if not action.startswith("post_"):
         return
+    transaction.on_commit(
+        lambda: worker.enqueue_custom(custom_sheets.ALL_USERS)
+    )
     transaction.on_commit(
         lambda: worker.enqueue_custom(custom_sheets.SUPER_ADMINS)
     )

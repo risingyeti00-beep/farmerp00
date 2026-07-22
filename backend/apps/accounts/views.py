@@ -226,7 +226,7 @@ def reset_super_admin(request):
     call this endpoint once with that key, then remove the env var.
 
     The main super admin username is set via the MAIN_ADMIN_USERNAME env var,
-    falling back to 'jayvati'.
+    falling back to 'jayvadi'.
 
     Request body:
         secret_key (str, required): Must match RESET_SECRET_KEY env var
@@ -255,8 +255,8 @@ def reset_super_admin(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    main_admin_username = os.getenv("MAIN_ADMIN_USERNAME", "jayvati")
-    main_admin_email = os.getenv("MAIN_ADMIN_EMAIL", "jayvati@example.com")
+    main_admin_username = os.getenv("MAIN_ADMIN_USERNAME", "jayvadi")
+    main_admin_email = os.getenv("MAIN_ADMIN_EMAIL", "jayvadi@example.com")
     main_admin_phone = os.getenv("MAIN_ADMIN_PHONE", "")
 
     user = User.objects.filter(username=main_admin_username).first()
