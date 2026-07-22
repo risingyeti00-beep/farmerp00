@@ -23,7 +23,7 @@ from rest_framework_simplejwt.views import TokenBlacklistView, TokenObtainPairVi
 from apps.core.permissions import IsSuperAdmin
 
 from .otp import OTP
-from .throttling import OtpSendThrottle, OtpVerifyThrottle
+from .throttling import ForgotPasswordThrottle, OtpSendThrottle, OtpVerifyThrottle
 from .serializers import (
     ChangePasswordSerializer,
     FarmTokenObtainPairSerializer,
@@ -35,6 +35,7 @@ from .serializers import (
     SuperAdminRegisterSerializer,
     UserCreateSerializer,
     UserSerializer,
+    VerifyForgotOtpSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -305,219 +306,233 @@ def phone_login(request):
 
 # ─── Forgot / Reset Password ────────────────────────────────────────────
 
-@extend_schema(request=ForgotPasswordSerializer, responses={200: {"type": "object", "properties": {"message": {"type": "string"}, "expires_in": {"type": "integer"}}}})
+
+@extend_schema(
+    request=ForgotPasswordSerializer,
+    responses={
+        200: {"type": "object", "properties": {"message": {"type": "string"}}},
+        404: {"type": "object", "properties": {"detail": {"type": "string"}}},
+        429: {"type": "object", "properties": {"detail": {"type": "string"}}},
+    },
+)
 @api_view(["POST"])
 @permission_classes([AllowAny])
-@throttle_classes([])
+@throttle_classes([ForgotPasswordThrottle])
 def forgot_password(request):
-    """Send a password-reset OTP to the email the user entered.
+    """Send a password-reset OTP to the registered email address.
 
-    Works for EVERY account — Super Admins, Managers, Employees and Workers —
-    with no cap on how many users or how many distinct addresses exist. The OTP
-    is delivered ONLY to the matched account's own registered email; the SMTP
-    sender account (EMAIL_HOST_USER) is used purely to send, never as a
-    recipient. Uses Django's configured EMAIL_BACKEND so it respects all EMAIL_*
-    settings.
+    The OTP is 6 digits, expires in 5 minutes, and is hashed in the database
+    using Django's PBKDF2 hasher — the plaintext is never persisted.
+
+    Rate-limited to 5 requests per hour per email address.
     """
     serializer = ForgotPasswordSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     email = serializer.validated_data["email"]
 
-    # Match by email across ALL roles (case-insensitively). Previously this was
-    # locked to role="SUPER_ADMIN", so managers/employees/workers could never
-    # reset their password — that was the real limitation, not the recipient.
+    # Check if email exists (any role, case-insensitive)
     user = User.objects.filter(email__iexact=email).first()
     if not user:
         return Response(
-            {"success": False, "message": "Email not found.", "detail": "Email not found."},
+            {"detail": "Email not registered."},
             status=status.HTTP_404_NOT_FOUND,
         )
 
+    # Check if user is active
     if not user.is_active:
         return Response(
-            {"detail": "This account is deactivated."},
+            {"detail": "This account has been deactivated. Please contact the administrator."},
             status=status.HTTP_403_FORBIDDEN,
         )
 
-    # Generate OTP using email as the identifier (reusing OTP model with PASSWORD_RESET purpose)
-    otp = OTP.generate(email, purpose="PASSWORD_RESET")
+    # Generate OTP — returns (otp_instance, plaintext_code)
+    otp, plain_code = OTP.generate(email, purpose="PASSWORD_RESET", expiry_minutes=5)
 
-    # ── Send OTP via Django's email framework ───────────────────────────
-    # Using send_mail() instead of raw smtplib so EMAIL_BACKEND, EMAIL_USE_TLS,
-    # and all other EMAIL_* settings are properly respected. This also makes it
-    # trivial to switch backends (e.g. console backend for testing).
+    # ── Send OTP via email ────────────────────────────────────────────
     subject = "FarmERP Pro - Password Reset OTP"
-    message = f"""Hello {user.get_full_name() or user.username},
+    message = (
+        f"Hello {user.get_full_name() or user.username},\n\n"
+        f"You requested a password reset for your FarmERP Pro account.\n\n"
+        f"Your OTP code is: {plain_code}\n\n"
+        f"This code expires in 5 minutes.\n\n"
+        f"If you did not request this, please ignore this email.\n\n"
+        f"- FarmERP Pro Team"
+    )
 
-You requested a password reset for your FarmERP Pro account.
-
-Your OTP code is: {otp.code}
-
-This code expires in 10 minutes.
-
-If you did not request this, please ignore this email.
-
-- FarmERP Pro Team"""
-
-    email_sent = False
-    error_detail = None
-
-    # Skip the SMTP attempt entirely when no credentials are configured.
-    # Otherwise send_mail() blocks for the full EMAIL_TIMEOUT (~30s) trying to
-    # reach a server it can't authenticate with, making the reset screen hang.
+    # Check email configuration
     email_configured = bool(
         settings.EMAIL_HOST_USER and settings.EMAIL_HOST_PASSWORD and settings.DEFAULT_FROM_EMAIL
     )
+
     if not email_configured:
-        error_detail = "Email is not configured (EMAIL_HOST_USER/EMAIL_HOST_PASSWORD)."
-        logger.info("[PASSWORD_RESET] Email not configured — returning OTP on screen for %s", email)
+        logger.error("[PASSWORD_RESET] Email not configured for %s", email)
+        return Response(
+            {"detail": "Email service is not configured. Please contact support."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
 
     try:
-        if not email_configured:
-            raise RuntimeError("email-not-configured")
-        logger.info(
-            "[PASSWORD_RESET] Attempting to send OTP %s to %s via %s:%s",
-            otp.code, email, settings.EMAIL_HOST, settings.EMAIL_PORT,
-        )
         send_mail(
             subject=subject,
             message=message,
             from_email=settings.DEFAULT_FROM_EMAIL,
-            # Deliver ONLY to the matched account's registered address — never to
-            # EMAIL_HOST_USER or any fixed literal. user.email is the stored,
-            # canonical address for whoever owns this account.
             recipient_list=[user.email],
             fail_silently=False,
         )
-        email_sent = True
-        logger.info("[PASSWORD_RESET] OTP email sent successfully to %s", email)
-    except RuntimeError:
-        pass  # email-not-configured sentinel — fall through to on-screen OTP
+        logger.info(
+            "[PASSWORD_RESET] OTP sent to %s (user=%s)",
+            email, user.username,
+        )
+        return Response({"message": "OTP sent successfully."})
+
     except smtplib.SMTPAuthenticationError as e:
-        error_detail = "SMTP Authentication Failed. Check EMAIL_HOST_USER and EMAIL_HOST_PASSWORD."
         logger.error(
-            "[PASSWORD_RESET] SMTP authentication failed for %s: %s",
+            "[PASSWORD_RESET] SMTP auth failed for %s: %s",
             settings.EMAIL_HOST_USER, e,
         )
-    except smtplib.SMTPConnectError as e:
-        error_detail = f"Unable to connect to SMTP server at {settings.EMAIL_HOST}:{settings.EMAIL_PORT}."
-        logger.error("[PASSWORD_RESET] SMTP connection failed: %s", e)
-    except smtplib.SMTPServerDisconnected as e:
-        error_detail = "SMTP server disconnected unexpectedly. Check EMAIL_HOST and EMAIL_PORT."
-        logger.error("[PASSWORD_RESET] SMTP disconnected: %s", e)
-    except smtplib.SMTPException as e:
-        error_detail = f"SMTP error: {e}"
-        logger.error("[PASSWORD_RESET] SMTP error: %s", e)
-    except ConnectionRefusedError:
-        error_detail = f"Connection refused by SMTP server at {settings.EMAIL_HOST}:{settings.EMAIL_PORT}. Is the server running?"
-        logger.error("[PASSWORD_RESET] Connection refused to %s:%s", settings.EMAIL_HOST, settings.EMAIL_PORT)
-    except TimeoutError:
-        error_detail = f"Connection timed out connecting to SMTP server at {settings.EMAIL_HOST}:{settings.EMAIL_PORT}."
-        logger.error("[PASSWORD_RESET] Connection timeout to %s:%s", settings.EMAIL_HOST, settings.EMAIL_PORT)
+        return Response(
+            {"detail": "Email service authentication failed. Please contact support."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    except (smtplib.SMTPException, ConnectionRefusedError, TimeoutError) as e:
+        logger.error("[PASSWORD_RESET] Email send failed: %s", e)
+        return Response(
+            {"detail": "Failed to send OTP email. Please try again later."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
     except Exception as e:
-        error_detail = f"Unexpected email error: {type(e).__name__}: {e}"
         logger.error("[PASSWORD_RESET] Unexpected email error:\n%s", traceback.format_exc())
-
-    if email_sent:
-        logger.info("[PASSWORD_RESET] OTP %s for %s stored in DB, expires in 10 min", otp.code, email)
-        return Response({
-            "success": True,
-            "detail": "OTP sent to your email.",
-            "expires_in": 600,
-            "email_sent": True,
-        })
-
-    # Email failed — return a proper error response with the real error detail.
-    # The OTP is still generated so the user can use it from the server logs
-    # if needed, but we don't return it to the client for security.
-    logger.warning(
-        "[PASSWORD_RESET] Email delivery failed for %s (%s). Falling back to on-screen OTP.",
-        email, error_detail,
-    )
-    # Graceful fallback: email isn't configured/reachable, so instead of a hard
-    # 500 that blocks the admin from ever resetting their password, return the
-    # OTP directly so the reset screen can show it. This mirrors the existing
-    # demo `send_otp` endpoint. Configure EMAIL_HOST_USER/EMAIL_HOST_PASSWORD
-    # (or an email API) to deliver the OTP by email instead of on screen.
-    return Response({
-        "success": True,
-        "detail": "Email delivery isn't configured, so your OTP is shown below.",
-        "otp": otp.code,
-        "email_sent": False,
-        "expires_in": 600,
-    })
+        return Response(
+            {"detail": "An unexpected error occurred. Please try again later."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
-@extend_schema(request=ResetPasswordSerializer, responses={200: {"type": "object", "properties": {"success": {"type": "boolean"}}}})
+@extend_schema(
+    request=VerifyForgotOtpSerializer,
+    responses={
+        200: {"type": "object", "properties": {"message": {"type": "string"}}},
+        400: {"type": "object", "properties": {"detail": {"type": "string"}}},
+        404: {"type": "object", "properties": {"detail": {"type": "string"}}},
+    },
+)
 @api_view(["POST"])
 @permission_classes([AllowAny])
 @throttle_classes([])
-def verify_reset_otp(request):
-    """Validate a password-reset OTP server-side, without consuming it.
+def verify_forgot_otp(request):
+    """Verify a password-reset OTP and mark it as verified.
 
-    The reset flow's middle step calls this so the entered code is checked for
-    real against the database — an exact value comparison against the one active
-    OTP for that email, plus expiry — instead of a client-side length/format
-    guess. A wrong code (e.g. 111111 when 745125 was sent) is rejected here. The
-    OTP's single use is still spent later, at reset_password, so verifying does
-    not burn the code.
+    The OTP is checked against the hashed value in the database. On success,
+    is_verified is set to True, which is required before the reset-password
+    endpoint will accept a new password. The OTP is NOT consumed here — it
+    remains usable until reset-password is called or it expires.
     """
-    email = (request.data.get("email") or "").strip()
-    code = (request.data.get("otp") or "").strip()
+    serializer = VerifyForgotOtpSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    email = serializer.validated_data["email"]
+    code = serializer.validated_data["otp"]
 
+    # Check email exists
     user = User.objects.filter(email__iexact=email).first()
     if not user:
         return Response(
-            {"success": False, "message": "Email not found.", "detail": "Email not found."},
+            {"detail": "Email not registered."},
             status=status.HTTP_404_NOT_FOUND,
         )
 
-    valid, reason = OTP.peek(email, code, purpose="PASSWORD_RESET")
-    if not valid:
-        message = "OTP has expired." if reason == "expired" else "Invalid OTP."
+    # Verify the OTP against the hashed code — uses check_password()
+    success, otp = OTP.verify_for_reset(email, code)
+
+    if not success:
+        # Check if there's an expired OTP to give a better error message
+        expired = OTP.objects.filter(
+            identifier=email, purpose="PASSWORD_RESET", is_used=False
+        ).first()
+        if expired and expired.is_expired:
+            return Response(
+                {"detail": "OTP has expired. Please request a new one."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         return Response(
-            {"success": False, "message": message, "detail": message},
+            {"detail": "Invalid OTP."},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    return Response({"success": True, "message": "OTP verified.", "detail": "OTP verified."})
+    return Response({"message": "OTP verified."})
 
 
-@extend_schema(request=ResetPasswordSerializer, responses={200: {"type": "object", "properties": {"detail": {"type": "string"}}}})
+@extend_schema(
+    request=ResetPasswordSerializer,
+    responses={
+        200: {"type": "object", "properties": {"message": {"type": "string"}}},
+        400: {"type": "object", "properties": {"detail": {"type": "string"}}},
+        403: {"type": "object", "properties": {"detail": {"type": "string"}}},
+        404: {"type": "object", "properties": {"detail": {"type": "string"}}},
+    },
+)
 @api_view(["POST"])
 @permission_classes([AllowAny])
 @throttle_classes([])
 def reset_password(request):
-    """Verify the OTP and set a new password for the matched account (any role)."""
+    """Reset the password for an account after OTP verification.
+
+    Only accepts requests where the OTP was previously verified via
+    verify-forgot-otp (is_verified=True). Once the password is changed,
+    the OTP is consumed (is_used=True) to prevent reuse.
+
+    The new password is hashed using Django's default PBKDF2 password hasher.
+    """
     serializer = ResetPasswordSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     email = serializer.validated_data["email"]
-    code = serializer.validated_data["otp"]
     new_password = serializer.validated_data["new_password"]
 
-    # Verify the OTP and consume it (single use). An expired match returns the
-    # OTP so we can report expiry precisely; a wrong value returns None.
-    success, otp = OTP.verify(email, code, purpose="PASSWORD_RESET")
-    if not success:
-        message = "OTP has expired." if (otp and otp.is_expired) else "Invalid OTP."
-        return Response(
-            {"success": False, "message": message, "detail": message},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    # Same rule as forgot_password: resolve the account by email across every
-    # role, so the reset works for whoever the OTP was issued to.
+    # Check email exists
     user = User.objects.filter(email__iexact=email).first()
     if not user:
         return Response(
-            {"success": False, "message": "Email not found.", "detail": "Email not found."},
+            {"detail": "Email not registered."},
             status=status.HTTP_404_NOT_FOUND,
         )
 
-    user.set_password(new_password)
-    user.save()
+    # Check if user is active
+    if not user.is_active:
+        return Response(
+            {"detail": "This account has been deactivated. Please contact the administrator."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
-    return Response({"detail": "Password reset successful. You can now log in with your new password."})
+    # Find the verified (but not yet used) OTP for this email
+    otp = OTP.objects.filter(
+        identifier=email,
+        purpose="PASSWORD_RESET",
+        is_used=False,
+        is_verified=True,
+    ).first()
+
+    if not otp:
+        return Response(
+            {"detail": "OTP not verified. Please verify your OTP first."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if otp.is_expired:
+        return Response(
+            {"detail": "OTP has expired. Please request a new one."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # Reset the password (Django's set_password uses PBKDF2 by default)
+    user.set_password(new_password)
+    user.save(update_fields=["password"])
+
+    # Consume the OTP — it cannot be reused
+    otp.is_used = True
+    otp.save(update_fields=["is_used"])
+
+    logger.info("[PASSWORD_RESET] Password reset successful for %s (user=%s)", email, user.username)
+
+    return Response({"message": "Password reset successful."})
 
 
 # ─── Existing UserViewSet ──────────────────────────────────────────────

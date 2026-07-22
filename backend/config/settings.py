@@ -241,8 +241,9 @@ REST_FRAMEWORK = {
     # prevent brute-force and enumeration attacks.  All other endpoints are
     # protected by JWT auth and are NOT throttled.
     "DEFAULT_THROTTLE_RATES": {
-        "otp_send": "5/minute",      # 5 OTP requests per phone/email per minute
+        "otp_send": "5/minute",      # 5 OTP requests per phone/email per minute (login OTP)
         "otp_verify": "10/minute",   # 10 verify attempts per phone/email per minute
+        "forgot_password": "5/hour", # 5 forgot-password OTP requests per email per hour
     },
 }
 

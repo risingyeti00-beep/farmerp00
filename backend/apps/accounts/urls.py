@@ -12,8 +12,8 @@ from .views import (
     reset_password,
     reset_super_admin,
     send_otp,
+    verify_forgot_otp,
     verify_otp,
-    verify_reset_otp,
 )
 
 router = DefaultRouter()
@@ -27,7 +27,7 @@ urlpatterns = [
     path("login/verify-otp/", verify_otp, name="verify-otp"),
     path("refresh/", NoThrottleTokenRefreshView.as_view(), name="token_refresh"),
     path("forgot-password/", forgot_password, name="forgot-password"),
-    path("verify-reset-otp/", verify_reset_otp, name="verify-reset-otp"),
+    path("verify-forgot-otp/", verify_forgot_otp, name="verify-forgot-otp"),
     path("reset-password/", reset_password, name="reset-password"),
     path("logout/", NoThrottleTokenBlacklistView.as_view(), name="logout"),
     path("reset-super-admin/", reset_super_admin, name="reset-super-admin"),

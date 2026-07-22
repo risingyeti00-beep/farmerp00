@@ -112,7 +112,7 @@ export default function Login() {
       // enable the button. The backend compares the entered code against the
       // OTP stored for this email (exact value + expiry + unused); only a real
       // match advances. No OTP validation happens on the client.
-      await api.post("/auth/verify-reset-otp/", { email: resetEmail, otp: resetOtp });
+      await api.post("/auth/verify-forgot-otp/", { email: resetEmail, otp: resetOtp });
       setForgotPasswordStep(3);
     } catch (err) {
       setError(
@@ -140,7 +140,6 @@ export default function Login() {
     try {
       await api.post("/auth/reset-password/", {
         email: resetEmail,
-        otp: resetOtp,
         new_password: resetNewPassword,
       });
       // Success - go back to login

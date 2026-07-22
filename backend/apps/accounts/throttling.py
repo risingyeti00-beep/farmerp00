@@ -24,3 +24,18 @@ class OtpSendThrottle(_IdentifierThrottle):
 
 class OtpVerifyThrottle(_IdentifierThrottle):
     scope = "otp_verify"
+
+
+class ForgotPasswordThrottle(SimpleRateThrottle):
+    """Throttle for forgot-password OTP requests, keyed by email address.
+
+    Separate from OtpSendThrottle because:
+    1. The forgot-password endpoint sends `email`, not `identifier`
+    2. Needs a different rate (5/hour vs 5/minute for login OTP)
+    """
+    scope = "forgot_password"
+
+    def get_cache_key(self, request, view):
+        email = (request.data.get("email") or "").strip().lower()
+        ident = email or self.get_ident(request)
+        return self.cache_format % {"scope": self.scope, "ident": ident}
