@@ -92,7 +92,7 @@ export default function Login() {
       await api.post("/auth/forgot-password/", { email: resetEmail });
       setForgotPasswordStep(2);
     } catch (err) {
-      setError(err.response?.data?.detail || "Failed to send OTP.");
+      setError(err.response?.data?.message || err.response?.data?.detail || "Failed to send OTP.");
     } finally {
       setLoading(false);
     }
@@ -147,7 +147,7 @@ export default function Login() {
       setResetConfirmPassword("");
       setError("");
     } catch (err) {
-      setError(err.response?.data?.detail || "Failed to reset password. Please check your OTP and try again.");
+      setError(err.response?.data?.message || err.response?.data?.detail || "Failed to reset password. Please check your OTP and try again.");
     } finally {
       setLoading(false);
     }

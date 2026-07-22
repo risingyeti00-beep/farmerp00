@@ -352,9 +352,11 @@ def phone_login(request):
 @extend_schema(
     request=ForgotPasswordSerializer,
     responses={
-        200: {"type": "object", "properties": {"message": {"type": "string"}}},
-        404: {"type": "object", "properties": {"detail": {"type": "string"}}},
-        429: {"type": "object", "properties": {"detail": {"type": "string"}}},
+        200: {"type": "object", "properties": {"success": {"type": "boolean"}, "message": {"type": "string"}}},
+        404: {"type": "object", "properties": {"success": {"type": "boolean"}, "message": {"type": "string"}}},
+        429: {"type": "object", "properties": {"success": {"type": "boolean"}, "message": {"type": "string"}}},
+        503: {"type": "object", "properties": {"success": {"type": "boolean"}, "message": {"type": "string"}}},
+        500: {"type": "object", "properties": {"success": {"type": "boolean"}, "message": {"type": "string"}}},
     },
 )
 @api_view(["POST"])
@@ -368,6 +370,7 @@ def forgot_password(request):
 
     Rate-limited to 5 requests per hour per email address.
     """
+    logger.info("[PASSWORD_RESET] Received forgot password request")
     serializer = ForgotPasswordSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     email = serializer.validated_data["email"]
@@ -375,20 +378,24 @@ def forgot_password(request):
     # Check if email exists (any role, case-insensitive)
     user = User.objects.filter(email__iexact=email).first()
     if not user:
+        logger.warning(f"[PASSWORD_RESET] Email {email} not registered")
         return Response(
-            {"detail": "Email not registered."},
+            {"success": False, "message": "Email not registered."},
             status=status.HTTP_404_NOT_FOUND,
         )
 
     # Check if user is active
     if not user.is_active:
+        logger.warning(f"[PASSWORD_RESET] User {email} is inactive")
         return Response(
-            {"detail": "This account has been deactivated. Please contact the administrator."},
+            {"success": False, "message": "This account has been deactivated. Please contact the administrator."},
             status=status.HTTP_403_FORBIDDEN,
         )
 
     # Generate OTP — returns (otp_instance, plaintext_code)
+    logger.info(f"[PASSWORD_RESET] Generating OTP for {email}")
     otp, plain_code = OTP.generate(email, purpose="PASSWORD_RESET", expiry_minutes=5)
+    logger.info(f"[PASSWORD_RESET] OTP generated successfully for {email}")
 
     # ── Send OTP via email ────────────────────────────────────────────
     subject = "FarmERP Pro - Password Reset OTP"
@@ -414,12 +421,13 @@ def forgot_password(request):
     if not email_configured:
         logger.error("[PASSWORD_RESET] Email NOT configured properly! Missing one or more required settings!")
         return Response(
-            {"detail": "Email service is not configured. Please contact support."},
+            {"success": False, "message": "Email service is not configured. Please contact support."},
             status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
     logger.info("[PASSWORD_RESET] Email configuration looks good!")
 
     try:
+        logger.info(f"[PASSWORD_RESET] Sending OTP email to {email}")
         send_mail(
             subject=subject,
             message=message,
@@ -428,30 +436,32 @@ def forgot_password(request):
             fail_silently=False,
         )
         logger.info(
-            "[PASSWORD_RESET] OTP sent to %s (user=%s)",
+            "[PASSWORD_RESET] OTP sent successfully to %s (user=%s)",
             email, user.username,
         )
-        return Response({"message": "OTP sent successfully."})
+        return Response({"success": True, "message": "OTP sent successfully."})
 
     except smtplib.SMTPAuthenticationError as e:
         logger.error(
             "[PASSWORD_RESET] SMTP auth failed for %s: %s",
             settings.EMAIL_HOST_USER, e,
         )
+        logger.error(traceback.format_exc())
         return Response(
-            {"detail": "Email service authentication failed. Please contact support."},
+            {"success": False, "message": "Unable to send OTP email."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
     except (smtplib.SMTPException, ConnectionRefusedError, TimeoutError) as e:
         logger.error("[PASSWORD_RESET] Email send failed: %s", e)
+        logger.error(traceback.format_exc())
         return Response(
-            {"detail": "Failed to send OTP email. Please try again later."},
+            {"success": False, "message": "Unable to send OTP email."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
     except Exception as e:
         logger.error("[PASSWORD_RESET] Unexpected email error:\n%s", traceback.format_exc())
         return Response(
-            {"detail": "An unexpected error occurred. Please try again later."},
+            {"success": False, "message": "Unable to send OTP email."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
@@ -459,9 +469,9 @@ def forgot_password(request):
 @extend_schema(
     request=VerifyForgotOtpSerializer,
     responses={
-        200: {"type": "object", "properties": {"message": {"type": "string"}}},
-        400: {"type": "object", "properties": {"detail": {"type": "string"}}},
-        404: {"type": "object", "properties": {"detail": {"type": "string"}}},
+        200: {"type": "object", "properties": {"success": {"type": "boolean"}, "message": {"type": "string"}}},
+        400: {"type": "object", "properties": {"success": {"type": "boolean"}, "message": {"type": "string"}}},
+        404: {"type": "object", "properties": {"success": {"type": "boolean"}, "message": {"type": "string"}}},
     },
 )
 @api_view(["POST"])
@@ -475,6 +485,7 @@ def verify_forgot_otp(request):
     endpoint will accept a new password. The OTP is NOT consumed here — it
     remains usable until reset-password is called or it expires.
     """
+    logger.info("[PASSWORD_RESET] Received OTP verification request")
     serializer = VerifyForgotOtpSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     email = serializer.validated_data["email"]
@@ -483,12 +494,14 @@ def verify_forgot_otp(request):
     # Check email exists
     user = User.objects.filter(email__iexact=email).first()
     if not user:
+        logger.warning(f"[PASSWORD_RESET] OTP verify failed: email {email} not registered")
         return Response(
-            {"detail": "Email not registered."},
+            {"success": False, "message": "Email not registered."},
             status=status.HTTP_404_NOT_FOUND,
         )
 
     # Verify the OTP against the hashed code — uses check_password()
+    logger.info(f"[PASSWORD_RESET] Verifying OTP for {email}")
     success, otp = OTP.verify_for_reset(email, code)
 
     if not success:
@@ -497,25 +510,28 @@ def verify_forgot_otp(request):
             identifier=email, purpose="PASSWORD_RESET", is_used=False
         ).first()
         if expired and expired.is_expired:
+            logger.warning(f"[PASSWORD_RESET] OTP verify failed: expired for {email}")
             return Response(
-                {"detail": "OTP has expired. Please request a new one."},
+                {"success": False, "message": "OTP expired."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        logger.warning(f"[PASSWORD_RESET] OTP verify failed: invalid for {email}")
         return Response(
-            {"detail": "Invalid OTP."},
+            {"success": False, "message": "Invalid OTP."},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    return Response({"message": "OTP verified."})
+    logger.info(f"[PASSWORD_RESET] OTP verified successfully for {email}")
+    return Response({"success": True, "message": "OTP verified."})
 
 
 @extend_schema(
     request=ResetPasswordSerializer,
     responses={
-        200: {"type": "object", "properties": {"message": {"type": "string"}}},
-        400: {"type": "object", "properties": {"detail": {"type": "string"}}},
-        403: {"type": "object", "properties": {"detail": {"type": "string"}}},
-        404: {"type": "object", "properties": {"detail": {"type": "string"}}},
+        200: {"type": "object", "properties": {"success": {"type": "boolean"}, "message": {"type": "string"}}},
+        400: {"type": "object", "properties": {"success": {"type": "boolean"}, "message": {"type": "string"}}},
+        403: {"type": "object", "properties": {"success": {"type": "boolean"}, "message": {"type": "string"}}},
+        404: {"type": "object", "properties": {"success": {"type": "boolean"}, "message": {"type": "string"}}},
     },
 )
 @api_view(["POST"])
@@ -530,6 +546,7 @@ def reset_password(request):
 
     The new password is hashed using Django's default PBKDF2 password hasher.
     """
+    logger.info("[PASSWORD_RESET] Received password reset request")
     serializer = ResetPasswordSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     email = serializer.validated_data["email"]
@@ -538,15 +555,17 @@ def reset_password(request):
     # Check email exists
     user = User.objects.filter(email__iexact=email).first()
     if not user:
+        logger.warning(f"[PASSWORD_RESET] Reset failed: email {email} not registered")
         return Response(
-            {"detail": "Email not registered."},
+            {"success": False, "message": "Email not registered."},
             status=status.HTTP_404_NOT_FOUND,
         )
 
     # Check if user is active
     if not user.is_active:
+        logger.warning(f"[PASSWORD_RESET] Reset failed: user {email} is inactive")
         return Response(
-            {"detail": "This account has been deactivated. Please contact the administrator."},
+            {"success": False, "message": "This account has been deactivated. Please contact the administrator."},
             status=status.HTTP_403_FORBIDDEN,
         )
 
@@ -559,28 +578,32 @@ def reset_password(request):
     ).first()
 
     if not otp:
+        logger.warning(f"[PASSWORD_RESET] Reset failed: OTP not verified for {email}")
         return Response(
-            {"detail": "OTP not verified. Please verify your OTP first."},
+            {"success": False, "message": "OTP not verified. Please verify your OTP first."},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
     if otp.is_expired:
+        logger.warning(f"[PASSWORD_RESET] Reset failed: OTP expired for {email}")
         return Response(
-            {"detail": "OTP has expired. Please request a new one."},
+            {"success": False, "message": "OTP expired."},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
     # Reset the password (Django's set_password uses PBKDF2 by default)
+    logger.info(f"[PASSWORD_RESET] Resetting password for {email}")
     user.set_password(new_password)
     user.save(update_fields=["password"])
 
     # Consume the OTP — it cannot be reused
     otp.is_used = True
     otp.save(update_fields=["is_used"])
+    logger.info(f"[PASSWORD_RESET] OTP marked as used for {email}")
 
     logger.info("[PASSWORD_RESET] Password reset successful for %s (user=%s)", email, user.username)
 
-    return Response({"message": "Password reset successful."})
+    return Response({"success": True, "message": "Password reset successful."})
 
 
 # ─── Existing UserViewSet ──────────────────────────────────────────────
