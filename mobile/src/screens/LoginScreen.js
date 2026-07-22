@@ -33,7 +33,7 @@ export default function LoginScreen() {
   const [resetOtp, setResetOtp] = useState('');
   const [resetNewPassword, setResetNewPassword] = useState('');
   const [resetConfirmPassword, setResetConfirmPassword] = useState('');
-  const [resetStep, setResetStep] = useState('email'); // email | otp | success
+  const [resetStep, setResetStep] = useState('email'); // email | otp | new_password | success
   const [resetLoading, setResetLoading] = useState(false);
   const [resetError, setResetError] = useState('');
 
@@ -76,7 +76,21 @@ export default function LoginScreen() {
       await client.post('/auth/forgot-password/', { email: resetEmail });
       setResetStep('otp');
     } catch (err) {
-      setResetError(err?.response?.data?.detail || 'Failed to send OTP.');
+      setResetError(err?.response?.data?.message || err?.response?.data?.detail || 'Failed to send OTP.');
+    } finally {
+      setResetLoading(false);
+    }
+  };
+
+  const handleVerifyOtp = async () => {
+    if (resetOtp.length < 6) return;
+    setResetLoading(true);
+    setResetError('');
+    try {
+      await client.post('/auth/verify-forgot-otp/', { email: resetEmail, otp: resetOtp });
+      setResetStep('new_password');
+    } catch (err) {
+      setResetError(err?.response?.data?.message || err?.response?.data?.detail || 'Invalid OTP.');
     } finally {
       setResetLoading(false);
     }
@@ -87,17 +101,20 @@ export default function LoginScreen() {
       setResetError('Passwords do not match.');
       return;
     }
+    if (resetNewPassword.length < 6) {
+      setResetError('Password must be at least 6 characters.');
+      return;
+    }
     setResetLoading(true);
     setResetError('');
     try {
       await client.post('/auth/reset-password/', {
         email: resetEmail,
-        otp: resetOtp,
         new_password: resetNewPassword,
       });
       setResetStep('success');
     } catch (err) {
-      setResetError(err?.response?.data?.detail || 'Password reset failed.');
+      setResetError(err?.response?.data?.message || err?.response?.data?.detail || 'Password reset failed. Please check your OTP and try again.');
     } finally {
       setResetLoading(false);
     }
@@ -186,9 +203,8 @@ export default function LoginScreen() {
                 <>
                   <Text style={styles.welcome}>Enter OTP</Text>
                   <Text style={styles.welcomeSub}>
-                    Enter the OTP sent to{' '}
-                    <Text style={{ fontWeight: '700' }}>{resetEmail}</Text> and set a new
-                    password.
+                    Enter the 6-digit code sent to{' '}
+                    <Text style={{ fontWeight: '700' }}>{resetEmail}</Text>.
                   </Text>
 
                   {resetError ? <Text style={styles.error}>{resetError}</Text> : null}
@@ -199,10 +215,39 @@ export default function LoginScreen() {
                     value={resetOtp}
                     onChangeText={(t) => setResetOtp(t.replace(/\D/g, '').slice(0, 6))}
                     keyboardType="number-pad"
-                    placeholder="000000"
+                    placeholder="6-digit code"
                     placeholderTextColor={theme.muted}
                     maxLength={6}
                   />
+
+                  <PrimaryButton
+                    title={resetLoading ? 'Verifying…' : 'Verify Code'}
+                    onPress={handleVerifyOtp}
+                    loading={resetLoading}
+                    disabled={resetOtp.length < 6}
+                    style={{ marginTop: 18 }}
+                  />
+
+                  <PrimaryButton
+                    title="Back"
+                    variant="outline"
+                    onPress={() => {
+                      setResetStep('email');
+                      setResetOtp('');
+                      setResetError('');
+                    }}
+                  />
+                </>
+              )}
+
+              {resetStep === 'new_password' && (
+                <>
+                  <Text style={styles.welcome}>Set New Password</Text>
+                  <Text style={styles.welcomeSub}>
+                    Choose a new password for your account.
+                  </Text>
+
+                  {resetError ? <Text style={styles.error}>{resetError}</Text> : null}
 
                   <Text style={styles.label}>New Password</Text>
                   <TextInput
@@ -228,7 +273,7 @@ export default function LoginScreen() {
                     title={resetLoading ? 'Resetting…' : 'Reset Password'}
                     onPress={handleResetPassword}
                     loading={resetLoading}
-                    disabled={resetOtp.length < 6 || !resetNewPassword}
+                    disabled={resetNewPassword.length < 6}
                     style={{ marginTop: 18 }}
                   />
 
@@ -236,8 +281,7 @@ export default function LoginScreen() {
                     title="Back"
                     variant="outline"
                     onPress={() => {
-                      setResetStep('email');
-                      setResetOtp('');
+                      setResetStep('otp');
                       setResetError('');
                     }}
                   />
