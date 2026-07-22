@@ -15,19 +15,19 @@ class Command(BaseCommand):
         parser.add_argument(
             "--username",
             type=str,
-            default="risingyeti",
-            help="Username of the super admin (default: risingyeti)",
+            default="jayvati",
+            help="Username of the super admin (default: jayvati)",
         )
 
     def handle(self, *args, **options):
         username = options["username"]
-        new_password = options.get("password") or "risingyeti123"
+        new_password = options.get("password") or "Jayvati@123"
 
         user, created = User.objects.update_or_create(
             username=username,
             defaults={
-                "email": "risingyeti00@gmail.com",
-                "phone": "+91 74879 37443",
+                "email": "jayvati@example.com",
+                "phone": "",
                 "role": "SUPER_ADMIN",
                 "is_staff": True,
                 "is_superuser": True,

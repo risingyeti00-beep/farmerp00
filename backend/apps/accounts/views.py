@@ -177,14 +177,17 @@ def verify_otp(request):
 @permission_classes([AllowAny])
 @throttle_classes([])
 def reset_super_admin(request):
-    """Emergency reset of the super admin (risingyeti) password.
+    """Emergency reset of the main super admin password.
 
     Protected by RESET_SECRET_KEY env var — set this in Railway dashboard,
     call this endpoint once with that key, then remove the env var.
 
+    The main super admin username is set via the MAIN_ADMIN_USERNAME env var,
+    falling back to 'jayvati'.
+
     Request body:
         secret_key (str, required): Must match RESET_SECRET_KEY env var
-        new_password (str, optional): New password. Defaults to "risingyeti123"
+        new_password (str, optional): New password. Defaults to "Jayvati@123"
     """
     import os
 
@@ -202,37 +205,49 @@ def reset_super_admin(request):
             status=status.HTTP_403_FORBIDDEN,
         )
 
-    new_password = request.data.get("new_password", "risingyeti123")
+    new_password = request.data.get("new_password", "Jayvati@123")
     if len(new_password) < 6:
         return Response(
             {"detail": "Password must be at least 6 characters long."},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    user = User.objects.filter(username="risingyeti").first()
+    main_admin_username = os.getenv("MAIN_ADMIN_USERNAME", "jayvati")
+    main_admin_email = os.getenv("MAIN_ADMIN_EMAIL", "jayvati@example.com")
+    main_admin_phone = os.getenv("MAIN_ADMIN_PHONE", "")
+
+    user = User.objects.filter(username=main_admin_username).first()
     if not user:
         # Create the super admin if missing
         from django.contrib.auth.hashers import make_password
         user = User.objects.create(
-            username="risingyeti",
-            email="risingyeti00@gmail.com",
-            phone="+91 74879 37443",
+            username=main_admin_username,
+            email=main_admin_email,
+            phone=main_admin_phone,
             role="SUPER_ADMIN",
             is_staff=True,
             is_superuser=True,
             is_active=True,
             password=make_password(new_password),
         )
-        logger.info("[RESET_ADMIN] Super admin 'risingyeti' created with new password")
+        logger.info("[RESET_ADMIN] Main super admin '%s' created with new password", main_admin_username)
     else:
         user.set_password(new_password)
+        user.is_superuser = True
+        user.is_staff = True
+        user.role = "SUPER_ADMIN"
         user.is_active = True
-        user.save(update_fields=["password", "is_active"])
-        logger.info("[RESET_ADMIN] Super admin 'risingyeti' password reset")
+        user.save(update_fields=["password", "is_superuser", "is_staff", "role", "is_active"])
+        logger.info("[RESET_ADMIN] Main super admin '%s' password reset", main_admin_username)
+
+    # Demote any other accounts that have is_superuser=True
+    demoted = User.objects.exclude(pk=user.pk).filter(is_superuser=True).update(is_superuser=False)
+    if demoted:
+        logger.info("[RESET_ADMIN] Demoted %d other user(s) from is_superuser", demoted)
 
     return Response({
         "detail": "Super admin password reset successful.",
-        "username": "risingyeti",
+        "username": main_admin_username,
         "password": new_password,
     })
 

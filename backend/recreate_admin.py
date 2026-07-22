@@ -6,30 +6,38 @@ django.setup()
 
 from apps.accounts.models import User, Role
 
-def recreate_risingyeti_admin():
-    # Check if user already exists
-    if User.objects.filter(username="risingyeti").exists():
-        print("User 'risingyeti' already exists!")
-        user = User.objects.get(username="risingyeti")
+def recreate_super_admin():
+    """Create or reactivate the main super admin account."""
+    username = "jayvati"
+    email = "jayvati@example.com"
+    default_password = "Admin@123"
+
+    if User.objects.filter(username=username).exists():
+        print(f"User '{username}' already exists!")
+        user = User.objects.get(username=username)
         user.is_active = True
         user.role = Role.SUPER_ADMIN
+        user.is_superuser = True
+        user.is_staff = True
         user.save()
-        print("User reactivated and set to SUPER_ADMIN.")
+        print(f"User reactivated and set to SUPER_ADMIN (main admin).")
         return
 
     # Create new super admin user
     user = User.objects.create_superuser(
-        username="risingyeti",
-        email="risingyeti00@gmail.com",
-        password="Admin@123"  # You can change this after creation!
+        username=username,
+        email=email,
+        password=default_password,
     )
     user.role = Role.SUPER_ADMIN
     user.is_active = True
     user.save()
-    print("Successfully recreated 'risingyeti' admin user!")
-    print("Username: risingyeti")
-    print("Password: Admin@123")
+    # Demote any other is_superuser users
+    User.objects.exclude(pk=user.pk).filter(is_superuser=True).update(is_superuser=False)
+    print(f"Successfully recreated '{username}' admin user!")
+    print(f"Username: {username}")
+    print(f"Password: {default_password}")
     print("Please change the password after logging in!")
 
 if __name__ == "__main__":
-    recreate_risingyeti_admin()
+    recreate_super_admin()

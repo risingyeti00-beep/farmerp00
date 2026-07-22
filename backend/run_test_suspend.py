@@ -31,7 +31,7 @@ def req(method, url, data=None, token=None):
 
 # Login
 status, data = req("POST", f"{BASE}/auth/login/",
-                   {"username": "risingyeti", "password": "risingyeti123"})
+                   {"username": "jayvati", "password": "Jayvati@123"})
 print(f"Login: HTTP {status}")
 token = data["access"]
 print(f"Token: {token[:50]}...\n")

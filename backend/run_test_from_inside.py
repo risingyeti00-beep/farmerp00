@@ -7,7 +7,7 @@ result = subprocess.run([
     'https://farmerp-backend-production.up.railway.app/api/v1/auth/login/',
     '-X', 'POST',
     '-H', 'Content-Type: application/json',
-    '-d', '{"username":"risingyeti","password":"risingyeti123"}'
+    '-d', '{"username":"jayvati","password":"Jayvati@123"}'
 ], capture_output=True, text=True)
 
 login_data = json.loads(result.stdout)
