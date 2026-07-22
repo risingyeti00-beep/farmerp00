@@ -1,72 +1,67 @@
-# ── Stage 1: dependency builder ──────────────────────────────────────────────
+# ── Stage 1: build dependencies ──────────────────────────────────────────────
 FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# System libs required by psycopg (libpq) and Pillow (jpeg/zlib)
+# Build-time system libs (compiler + headers for psycopg3 and Pillow)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
     libpq-dev \
     libjpeg-dev \
     zlib1g-dev \
-    gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin pip and install dependencies
 COPY requirements.txt .
 RUN pip install --upgrade pip --no-cache-dir && \
     pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 
-# ── Stage 2: runtime image ────────────────────────────────────────────────────
+# ── Stage 2: production runtime ───────────────────────────────────────────────
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    DJANGO_SETTINGS_MODULE=config.settings \
+    PORT=8000
 
-# Only runtime shared libraries needed (no build tools)
+# Runtime-only shared libs + curl (healthcheck)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     libjpeg62-turbo \
     zlib1g \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user for security
+# Non-root user
 RUN useradd -m -u 1000 appuser
 
-# Copy installed packages from builder
+# Installed Python packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy project source (venv2/, media/, db.sqlite3 excluded via .dockerignore)
+# Application source (venv2/, media/, db.sqlite3, .env excluded via .dockerignore)
 COPY --chown=appuser:appuser . .
 
 # Collect static files at build time (WhiteNoise serves them at runtime).
-# A dummy SECRET_KEY is supplied only for this build step (settings.py requires
-# one to import); the real value is injected at runtime.
-RUN SECRET_KEY=build-time-only python manage.py collectstatic --noinput
+# A dummy SECRET_KEY is used only for this step; the real value is injected at runtime.
+RUN SECRET_KEY=build-time-only \
+    DATABASE_URL="" \
+    python manage.py collectstatic --noinput
 
-# NOTE: user-uploaded media goes to Supabase Storage, not local disk, so no
-# Docker VOLUME is needed. Railway also rejects the VOLUME instruction
-# ("use Railway Volumes"), which fails the build — so it is intentionally omitted.
+# Make entrypoint executable
+RUN chmod +x /app/entrypoint.sh
 
-# Switch to non-root user
 USER appuser
 
 EXPOSE 8000
 
-# ── Health check ─────────────────────────────────────────────────────────────
-# Use a socket check — guaranteed to work even without a /health/ endpoint.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD python -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('localhost', int('${PORT:-8000}'))); s.close()" || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-8000}/api/health/ || \
+        curl -f http://localhost:${PORT:-8000}/admin/login/ || exit 1
 
-# ── Startup ────────────────────────────────────────────────────────────────
-# Run migrations, then start Daphne (HTTP + WebSocket).
-# Railway sets $PORT automatically; fall back to 8000 for local Docker.
-CMD sh -c "python manage.py migrate --noinput && exec daphne -b 0.0.0.0 -p ${PORT:-8000} config.asgi:application"
+ENTRYPOINT ["/app/entrypoint.sh"]

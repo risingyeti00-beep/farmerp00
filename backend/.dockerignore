@@ -1,13 +1,48 @@
+# Virtual environments
 venv/
 venv2/
+.venv/
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# Environment & secrets
 .env
 credentials/
+
+# Local DB & uploads (Supabase handles these in production)
 db.sqlite3
 media/
+
+# Pre-built static files (regenerated inside Docker via collectstatic)
 staticfiles/
+
+# Logs & OS noise
 *.log
 .DS_Store
+Thumbs.db
+
+# Dev/test artefacts
+Dockerfile.test
+*.md
 .gitignore
+.railwayignore
+.trae/
+.claude/
+.agents/
+.railway/
+.railway-config-pull-*/
+
+# One-off scripts (not needed in the image)
+check_*.py
+force_*.py
+recreate_*.py
+run_test*.py
+sync_*.py
+datadump.json
+temp_*.txt
