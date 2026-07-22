@@ -1,4 +1,5 @@
 import logging
+import re
 import smtplib
 import traceback
 
@@ -107,18 +108,59 @@ class NoThrottleTokenBlacklistView(TokenBlacklistView):
 @permission_classes([AllowAny])
 @throttle_classes([OtpSendThrottle])
 def send_otp(request):
-    """Send OTP to a phone number OR email. For demo, returns the OTP in response."""
+    """Send OTP to a phone number OR email.
+
+    For email identifiers, the OTP is sent via SMTP email.
+    For phone numbers, the OTP is logged server-side only.
+    The OTP code is NEVER returned in the response.
+    """
     serializer = OtpSendSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     identifier = serializer.validated_data["identifier"]
 
-    otp = OTP.generate(identifier)
+    otp, plain_code = OTP.generate(identifier, purpose="LOGIN", expiry_minutes=5)
 
-    print(f"[OTP] {identifier} -> {otp.code}")
+    logger.info("[OTP] Generated OTP for %s", identifier)
+
+    # ── If identifier looks like an email, send OTP via SMTP ──
+    if re.match(r"[^@]+@[^@]+\.[^@]+", identifier):
+        email_configured = bool(
+            settings.EMAIL_HOST_USER and settings.EMAIL_HOST_PASSWORD and settings.DEFAULT_FROM_EMAIL
+        )
+        if email_configured:
+            user = User.objects.filter(email__iexact=identifier).first()
+            subject = "FarmERP Pro - Login OTP"
+            message = (
+                f"Hello{(' ' + user.get_full_name()) if user and user.get_full_name().strip() else ''},\n\n"
+                f"Your login OTP code is: {plain_code}\n\n"
+                f"This code expires in 5 minutes.\n\n"
+                f"If you did not request this, please ignore this email.\n\n"
+                f"- FarmERP Pro Team"
+            )
+            try:
+                send_mail(
+                    subject=subject,
+                    message=message,
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[identifier],
+                    fail_silently=False,
+                )
+                logger.info("[OTP] OTP sent via email to %s", identifier)
+            except Exception as e:
+                logger.error("[OTP] Failed to send email to %s: %s", identifier, e)
+                # Return error so the frontend can show a meaningful message
+                return Response(
+                    {"detail": "Failed to send OTP email. Please try again later."},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+        else:
+            logger.warning("[OTP] Email not configured — OTP for %s logged only", identifier)
+    else:
+        # Phone number OTP — log only since no SMS integration
+        logger.info("[OTP] Phone OTP generated for %s (not sent — no SMS integration)", identifier)
 
     payload = {
         "message": "OTP sent successfully.",
-        "otp": otp.code,
         "expires_in": 600,
     }
     return Response(payload)

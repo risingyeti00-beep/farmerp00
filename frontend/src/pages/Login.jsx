@@ -35,7 +35,6 @@ export default function Login() {
   const [resetOtp, setResetOtp] = useState("");
   const [resetNewPassword, setResetNewPassword] = useState("");
   const [resetConfirmPassword, setResetConfirmPassword] = useState("");
-  const [resetOtpHint, setResetOtpHint] = useState(""); // OTP shown on-screen when email isn't configured
 
   useEffect(() => {
     if (user) navigate("/");
@@ -90,10 +89,7 @@ export default function Login() {
     setLoading(true);
     setError("");
     try {
-      const res = await api.post("/auth/forgot-password/", { email: resetEmail });
-      // When email delivery isn't configured, the backend returns the OTP so we
-      // can show it on screen; otherwise it was emailed and no otp is returned.
-      setResetOtpHint(res?.data?.email_sent === false && res?.data?.otp ? res.data.otp : "");
+      await api.post("/auth/forgot-password/", { email: resetEmail });
       setForgotPasswordStep(2);
     } catch (err) {
       setError(err.response?.data?.detail || "Failed to send OTP.");
@@ -305,26 +301,10 @@ export default function Login() {
 
                 {forgotPasswordStep === 2 && (
                   <form onSubmit={handleVerifyOtp} className="space-y-4">
-                    {resetOtpHint ? (
-                      <div className="rounded-xl bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-amber-200">
-                        <p className="mb-1">Email delivery isn't set up, so here is your code:</p>
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="font-mono text-xl font-bold tracking-widest text-amber-900">{resetOtpHint}</span>
-                          <button
-                            type="button"
-                            onClick={() => setResetOtp(resetOtpHint)}
-                            className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-amber-700"
-                          >
-                            Use code
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <p className="flex items-center gap-2 rounded-xl bg-brand-50/60 p-3 text-sm text-gray-600 ring-1 ring-brand-100">
-                        <Mail size={15} className="shrink-0 text-brand-600" />
-                        <span>Code sent to <span className="font-semibold text-gray-800">{resetEmail}</span></span>
-                      </p>
-                    )}
+                    <p className="flex items-center gap-2 rounded-xl bg-brand-50/60 p-3 text-sm text-gray-600 ring-1 ring-brand-100">
+                      <Mail size={15} className="shrink-0 text-brand-600" />
+                      <span>Code sent to <span className="font-semibold text-gray-800">{resetEmail}</span></span>
+                    </p>
                     <LeafField
                       label="One-Time Code"
                       type="text"
