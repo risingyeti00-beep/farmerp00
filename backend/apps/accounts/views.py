@@ -401,17 +401,23 @@ def forgot_password(request):
         f"- FarmERP Pro Team"
     )
 
-    # Check email configuration
+    # Check email configuration with detailed logging
+    logger.info("[PASSWORD_RESET] Checking email config...")
+    logger.info(f"[PASSWORD_RESET] EMAIL_HOST_USER: '{settings.EMAIL_HOST_USER}'")
+    logger.info(f"[PASSWORD_RESET] EMAIL_HOST_PASSWORD is set: {bool(settings.EMAIL_HOST_PASSWORD)}")
+    logger.info(f"[PASSWORD_RESET] DEFAULT_FROM_EMAIL: '{settings.DEFAULT_FROM_EMAIL}'")
+    
     email_configured = bool(
         settings.EMAIL_HOST_USER and settings.EMAIL_HOST_PASSWORD and settings.DEFAULT_FROM_EMAIL
     )
 
     if not email_configured:
-        logger.error("[PASSWORD_RESET] Email not configured for %s", email)
+        logger.error("[PASSWORD_RESET] Email NOT configured properly! Missing one or more required settings!")
         return Response(
             {"detail": "Email service is not configured. Please contact support."},
             status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
+    logger.info("[PASSWORD_RESET] Email configuration looks good!")
 
     try:
         send_mail(
